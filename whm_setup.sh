@@ -1,13 +1,20 @@
 #!/bin/bash
 ###############################################################################
 # WHM / cPanel Server Setup & Hardening Script
-# - Disable WHM Terminal
-# - Enable backups (Daily / Weekly / Monthly - 1 copy each)
-# - Install & enable CSF (ConfigServer Security & Firewall)
-# - Install all available PHP versions (EasyApache4) + common extensions
-# - Disable dangerous PHP functions in EVERY installed PHP version
-# - Run /scripts/securetmp
-# - Append the custom security banner to /root/.bash_profile
+# Programmed by: Eng. Samir Abo El-Kheir (م. سمير أبو الخير)
+# Version: 3
+#
+#  1) Disable WHM Terminal
+#  2) Enable backups (Daily / Weekly / Monthly - 1 copy each)
+#  3) Install & enable CSF (ConfigServer Security & Firewall)
+#  4) Install all available PHP versions (EasyApache4) + common extensions
+#  5) Disable dangerous PHP functions in EVERY installed PHP version
+#  6) Run /scripts/securetmp
+#  7) Enable cPHulk Brute Force Protection
+#  8) Install & enable ModSecurity + OWASP Core Rule Set
+#  9) Set up root SSH key (generate local keypair + add provided public key)
+# 10) Change SSH port to 2649 and allow it in CSF
+# 11) Append the custom security banner to /root/.bash_profile
 #
 # Run as root on a cPanel/WHM server:
 #   bash whm_setup.sh
@@ -18,7 +25,8 @@ LOG="/root/whm_setup_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "=================================================================="
-echo " WHM Setup Script - started $(date)"
+echo " WHM Setup Script v3 - by Eng. Samir Abo El-Kheir"
+echo " Started $(date)"
 echo " Log file: $LOG"
 echo "=================================================================="
 
@@ -30,7 +38,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-if [ ! -x /usr/local/cpanel/cpanel ] && [ ! -x /usr/sbin/whmapi1 ] && ! command -v whmapi1 >/dev/null 2>&1; then
+if [ ! -x /usr/local/cpanel/cpanel ] && ! command -v whmapi1 >/dev/null 2>&1; then
     echo "[ERROR] This does not look like a cPanel/WHM server (whmapi1 not found)." >&2
     exit 1
 fi
@@ -39,7 +47,7 @@ fi
 # 1) Disable WHM Terminal
 # ---------------------------------------------------------------------------
 echo
-echo "== [1/6] Disabling WHM Terminal =="
+echo "== [1/11] Disabling WHM Terminal =="
 touch /var/cpanel/disable_whm_terminal_ui
 echo "Done: /var/cpanel/disable_whm_terminal_ui created."
 
@@ -47,7 +55,7 @@ echo "Done: /var/cpanel/disable_whm_terminal_ui created."
 # 2) Enable Backups: Daily / Weekly / Monthly, 1 copy each
 # ---------------------------------------------------------------------------
 echo
-echo "== [2/6] Configuring cPanel Backups =="
+echo "== [2/11] Configuring cPanel Backups =="
 whmapi1 backup_config_set \
     backupenable=1 \
     backuptype=compressed \
@@ -72,7 +80,7 @@ echo "      (BACKUPDIR) - this script does not change the storage destination."
 # 3) Install & enable CSF (ConfigServer Security & Firewall)
 # ---------------------------------------------------------------------------
 echo
-echo "== [3/6] Installing CSF =="
+echo "== [3/11] Installing CSF =="
 if [ -d /etc/csf ]; then
     echo "CSF already installed, skipping install, will just re-enable it."
 else
@@ -89,9 +97,7 @@ else
 fi
 
 if [ -f /etc/csf/csf.conf ]; then
-    # Turn off TESTING mode so the firewall actually enforces rules
     sed -i 's/^TESTING = "1"/TESTING = "0"/' /etc/csf/csf.conf
-    # Make sure csf & lfd are enabled to start on boot and start now
     systemctl enable csf lfd 2>/dev/null
     systemctl restart lfd 2>/dev/null
     csf -r
@@ -104,7 +110,7 @@ fi
 # 4) Install every available PHP version (EasyApache4) + common extensions
 # ---------------------------------------------------------------------------
 echo
-echo "== [4/6] Installing all EasyApache4 PHP versions =="
+echo "== [4/11] Installing all EasyApache4 PHP versions =="
 
 PHP_VERSIONS=$(repoquery --repoid=EA4 --queryformat="%{name}" 2>/dev/null | grep -Eoh "ea-php[0-9]{2}" | sort -u)
 
@@ -126,7 +132,6 @@ for ver in $PHP_VERSIONS; do
     yum install -y $pkgs
 done
 
-# Register/activate installed versions with cPanel's MultiPHP system
 /usr/local/cpanel/scripts/build_local_repo_conf 2>/dev/null
 whmapi1 php_get_installable_versions >/dev/null 2>&1
 
@@ -136,7 +141,7 @@ echo "PHP installation step complete."
 # 5) Disable dangerous PHP functions in EVERY installed PHP version
 # ---------------------------------------------------------------------------
 echo
-echo "== [5/6] Disabling risky PHP functions in all installed versions =="
+echo "== [5/11] Disabling risky PHP functions in all installed versions =="
 
 DISABLE_FUNCS="dl,exec,system,shell_exec,passthru,popen,proc_open,proc_close,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,escapeshellcmd,escapeshellarg,posix_kill,posix_setuid,posix_setgid,posix_setsid,posix_setpgid,posix_mknod,posix_seteuid,posix_setegid,apache_child_terminate,apache_setenv,apache_note,ini_restore,define_syslog_variables,openlog,syslog,closelog,leak,listen,virtual,show_source"
 
@@ -151,7 +156,6 @@ for ini in /opt/cpanel/ea-php*/root/etc/php.ini; do
     fi
 done
 
-# Restart PHP-FPM / Apache so changes take effect
 /usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
 /usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
 
@@ -161,18 +165,144 @@ echo "disable_functions applied to all php.ini files found under /opt/cpanel/."
 # 6) Run /scripts/securetmp
 # ---------------------------------------------------------------------------
 echo
-echo "== [6/6] Running /scripts/securetmp =="
+echo "== [6/11] Running /scripts/securetmp =="
 if [ -x /scripts/securetmp ]; then
     /scripts/securetmp
 else
     echo "[WARN] /scripts/securetmp not found or not executable."
 fi
 
+# ---------------------------------------------------------------------------
+# 7) Enable cPHulk Brute Force Protection
+# ---------------------------------------------------------------------------
+echo
+echo "== [7/11] Enabling cPHulk Brute Force Protection =="
+whmapi1 enable_cphulk
+whmapi1 save_cphulk_config \
+    ip_based_protection=1 \
+    block_brute_force_with_firewall=1 \
+    block_excessive_brute_force_with_firewall=1 \
+    ip_brute_force_period_mins=15 \
+    lookback_period_min=360 \
+    mark_as_brute=30
+
+echo "cPHulk enabled with firewall-based blocking for brute force attempts."
+echo "IMPORTANT: whitelist your own admin IP(s) in WHM >> cPHulk Brute Force Protection >> Whitelist Management"
+echo "           to avoid locking yourself out."
+
+# ---------------------------------------------------------------------------
+# 8) Install & enable ModSecurity + OWASP Core Rule Set
+# ---------------------------------------------------------------------------
+echo
+echo "== [8/11] Installing ModSecurity + OWASP CRS =="
+
+if ! rpm -qa | grep -q ea-apache24-mod_security2; then
+    yum install -y ea-apache24-mod_security2
+fi
+
+yum install -y ea-modsec2-rules-owasp-crs
+
+if [ -f /etc/apache2/conf.d/modsec2.conf ]; then
+    sed -i 's/^SecRuleEngine.*/SecRuleEngine On/' /etc/apache2/conf.d/modsec2.conf 2>/dev/null
+fi
+
+whmapi1 modsec_configure enabled=1 2>/dev/null
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+echo "ModSecurity + OWASP CRS installed and enabled (SecRuleEngine On)."
+echo "NOTE: OWASP CRS can occasionally flag legitimate traffic (false positives)."
+echo "      Monitor WHM >> Security Center >> ModSecurity Tools for the first few days"
+echo "      and add per-site exceptions there if a real site gets blocked."
+
+# ---------------------------------------------------------------------------
+# 9) Root SSH key setup
+# ---------------------------------------------------------------------------
+echo
+echo "== [9/11] Setting up root SSH key access =="
+
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+if [ ! -f /root/.ssh/id_rsa ]; then
+    ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N "" -C "root@$(hostname)"
+    echo "New local keypair generated: /root/.ssh/id_rsa / id_rsa.pub"
+else
+    echo "Local keypair already exists at /root/.ssh/id_rsa, skipping generation."
+fi
+
+PUBKEY='ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAsJAbH514tlSeiPoe84iSxfWCS1VQ2uEFC6h84pXt1Xne9V6d5TJ+1i35w8djPy+fiuSvgEx8DOtbK6+sQD2MXAXH9MUmj7ePT5XUgPRHgzoSpducxbn1prnxiNtj+TVJChC9j8sFK+hJKLpz9MvMsFqKRu0FqOIxl7cc11zQo/xD+3Lh+c+dYZBo90mS90tsmshy7Isz2FmVrTsyC4en3wauYm8xlOtabhC/W+bq3fzQVqSe+GoE3pIYdH11ow56+qHzuUxv027x2V+k63TvysTVic5WKLh1LjatkAZp4BxYffgsxU6wIRogJvG3F6hELnbLW90HYogaPeaQqzwX9Q== root@CentOS-69-64-minimal'
+
+if grep -qF "$PUBKEY" /root/.ssh/authorized_keys 2>/dev/null; then
+    echo "Provided public key already present in authorized_keys, skipping."
+else
+    echo "$PUBKEY" >> /root/.ssh/authorized_keys
+    echo "Provided public key appended to /root/.ssh/authorized_keys."
+fi
+
+echo "Reminder: this ONLY adds a public key for key-based login. It does not"
+echo "          disable password authentication."
+
+# ---------------------------------------------------------------------------
+# 10) Change SSH port to 2649 and allow it in CSF
+# ---------------------------------------------------------------------------
+echo
+echo "== [10/11] Changing SSH port to 2649 and allowing it in CSF =="
+
+NEW_SSH_PORT=2649
+
+# Allow the new port in CSF BEFORE touching sshd, so it's never blocked
+if [ -f /etc/csf/csf.conf ]; then
+    for DIR in TCP_IN TCP_OUT; do
+        CURRENT=$(grep "^${DIR} = " /etc/csf/csf.conf | sed -E "s/^${DIR} = \"(.*)\"/\1/")
+        if [[ ",${CURRENT}," != *",${NEW_SSH_PORT},"* ]]; then
+            sed -i "s/^${DIR} = \"\(.*\)\"/${DIR} = \"\1,${NEW_SSH_PORT}\"/" /etc/csf/csf.conf
+        fi
+    done
+    csf -r
+    echo "Port ${NEW_SSH_PORT} added to CSF TCP_IN/TCP_OUT and firewall reloaded."
+else
+    echo "[WARN] /etc/csf/csf.conf not found - CSF port rule NOT added."
+fi
+
+# Update sshd_config
+if grep -q "^Port " /etc/ssh/sshd_config; then
+    sed -i "s/^Port .*/Port ${NEW_SSH_PORT}/" /etc/ssh/sshd_config
+else
+    echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
+fi
+sed -i "s/^Port 22$/#Port 22/" /etc/ssh/sshd_config 2>/dev/null
+
+# Keep cPanel's chkservd service monitor in sync so it doesn't flag sshd as down
+if [ -f /etc/chkserv.d/sshd ]; then
+    sed -i "s/^sshd:.*/sshd:${NEW_SSH_PORT}/" /etc/chkserv.d/sshd
+fi
+
+# SELinux: allow sshd to bind the new port if SELinux is enforcing
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ] && command -v semanage >/dev/null 2>&1; then
+    semanage port -a -t ssh_port_t -p tcp ${NEW_SSH_PORT} 2>/dev/null \
+      || semanage port -m -t ssh_port_t -p tcp ${NEW_SSH_PORT} 2>/dev/null
+fi
+
+# Apply the new sshd config
+sshd -t && (systemctl restart sshd 2>/dev/null || service sshd restart 2>/dev/null)
+/scripts/restartsrv_chkservd 2>/dev/null
+
+echo "SSH is now configured to listen on port ${NEW_SSH_PORT}."
+echo "!!! DO NOT CLOSE THIS SESSION !!!"
+echo "Open a NEW terminal and test: ssh -p ${NEW_SSH_PORT} root@<server-ip>"
+echo "Only close this current session after that new connection succeeds."
+echo "Also remember: if this server sits behind a cloud/VPS provider firewall"
+echo "(security group, network ACL, etc.) you must open port ${NEW_SSH_PORT} there too."
+
 ###############################################################################
-# 7) Append custom banner/security code to /root/.bash_profile
+# 11) Append custom banner/security code to /root/.bash_profile
 ###############################################################################
 echo
-echo "== Updating /root/.bash_profile =="
+echo "== [11/11] Updating /root/.bash_profile =="
 
 BASH_PROFILE="/root/.bash_profile"
 if [ -f "$BASH_PROFILE" ]; then
@@ -267,6 +397,8 @@ echo " Finished $(date)"
 echo " Full log saved at: $LOG"
 echo "=================================================================="
 echo "Reminders:"
-echo " - Review the CSF install output above; you may want to whitelist your own IP in /etc/csf/csf.allow before restarting csf again."
+echo " - Whitelist your admin IP in /etc/csf/csf.allow AND in WHM >> cPHulk Whitelist Management."
+echo " - Watch ModSecurity Tools for false positives for a few days after enabling."
 echo " - Verify backup destination (BACKUPDIR) in WHM >> Backup Configuration."
-echo " - Confirm mail delivery to linux.system25@gmail.com works (mail/sendmail must be configured) for the root-login alert to fire."
+echo " - Confirm mail/sendmail works so the root-login alert email actually delivers."
+echo " - Test SSH login on the new port (2649) from a NEW session before closing this one."
