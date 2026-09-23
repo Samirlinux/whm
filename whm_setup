@@ -1,0 +1,690 @@
+#!/bin/bash
+###############################################################################
+# WHM / cPanel Server Setup & Hardening Script
+# Programmed by: Eng. Samir Abo El-Kheir
+# Version: 4
+#
+#  1) Disable WHM Terminal (admin-level) / Enable cPanel's own Terminal for users
+#  2) Enable backups (Daily / Weekly / Monthly - 1 copy each)
+#  3) Install & enable CSF (ConfigServer Security & Firewall)
+#  4) Install all available PHP versions (EasyApache4) + common extensions,
+#     imagick/redis via PECL, and Node.js/npm via EasyApache4 ea-nodejsXX
+#  5) Disable dangerous PHP functions in EVERY installed PHP version,
+#     then apply custom PHP resource-limit directives
+#  6) Run /scripts/securetmp
+#  7) Enable cPHulk Brute Force Protection
+#  8) Install & enable ModSecurity + OWASP Core Rule Set
+#  9) Set up root SSH key (generate local keypair + add provided public key)
+# 10) Change SSH port to 2649 and allow it in CSF
+# 11) Append the custom security banner to /root/.bash_profile
+#
+# Recommended usage (professional / repeatable, not a one-off download):
+#   git clone https://github.com/Samirlinux/whm.git /opt/whm-setup
+#   cd /opt/whm-setup && bash whm_setup
+#   # to update later: cd /opt/whm-setup && git pull && bash whm_setup
+###############################################################################
+
+# Bump this on every change pushed to the repo so any server's log clearly
+# shows which revision of the script actually ran (git log / GitHub tags
+# should carry a matching tag, e.g. v4.0.0).
+SCRIPT_VERSION="4.0.0"
+
+set -uo pipefail
+LOG="/root/whm_setup_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "=================================================================="
+echo " WHM Setup Script v${SCRIPT_VERSION} - by Eng. Samir Abo El-Kheir"
+echo " Started $(date)"
+echo " Log file: $LOG"
+if command -v git >/dev/null 2>&1 && git -C "$(dirname "$0")" rev-parse --short HEAD >/dev/null 2>&1; then
+    echo " Git commit: $(git -C "$(dirname "$0")" rev-parse --short HEAD) (branch: $(git -C "$(dirname "$0")" rev-parse --abbrev-ref HEAD))"
+fi
+echo "=================================================================="
+
+# ---------------------------------------------------------------------------
+# 0) Sanity checks
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[ERROR] Must be run as root." >&2
+    exit 1
+fi
+
+if [ ! -x /usr/local/cpanel/cpanel ] && ! command -v whmapi1 >/dev/null 2>&1; then
+    echo "[ERROR] This does not look like a cPanel/WHM server (whmapi1 not found)." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 1) Disable WHM Terminal
+# ---------------------------------------------------------------------------
+echo
+echo "== [1/11] Disabling WHM Terminal =="
+touch /var/cpanel/disable_whm_terminal_ui
+echo "Done: /var/cpanel/disable_whm_terminal_ui created, WHM Terminal (root/reseller"
+echo "admin-level, WHM >> Server Configuration >> Terminal) stays disabled."
+
+# ---------------------------------------------------------------------------
+# 1b) Enable cPanel's OWN Terminal (cPanel >> Advanced >> Terminal) for
+#     cPanel users - this is a DIFFERENT feature/toggle than WHM Terminal
+#     above. It needs two things: the "Terminal" feature turned on in every
+#     feature list, AND shell access enabled on each account.
+# ---------------------------------------------------------------------------
+echo
+echo "== [1b/11] Enabling cPanel's own Terminal (cPanel >> Advanced >> Terminal) =="
+echo "[WARN] This gives EVERY cPanel account (not just root) command-line"
+echo "[WARN] access to the server under their own user. Combined with a"
+echo "[WARN] Normal (non-jailed) shell this is a significant privilege"
+echo "[WARN] increase for every hosting customer on this box - make sure"
+echo "[WARN] that is actually what you want before continuing."
+
+# 1) Turn the "Terminal" feature ON in every existing feature list, so it's
+#    not hidden from users whose feature list excludes it.
+if [ -d /var/cpanel/featurelists ]; then
+    for fl in /var/cpanel/featurelists/*.conf; do
+        [ -f "$fl" ] || continue
+        cp -a "$fl" "${fl}.bak_$(date +%Y%m%d%H%M%S)"
+        if grep -q '^terminal=' "$fl"; then
+            sed -i 's/^terminal=.*/terminal=1/' "$fl"
+        else
+            echo "terminal=1" >> "$fl"
+        fi
+    done
+    echo "Terminal feature enabled in all existing feature lists under /var/cpanel/featurelists/."
+else
+    echo "[WARN] /var/cpanel/featurelists not found, skipping feature-list edit."
+fi
+
+# 2) Grant shell access to every existing cPanel account so the Terminal
+#    app actually has a shell to open. Defaults to jailed shell via WHM's
+#    own default unless the account already specifies otherwise.
+if [ -d /var/cpanel/users ]; then
+    for userfile in /var/cpanel/users/*; do
+        acct=$(basename "$userfile")
+        # Skip WHM's own internal/reserved entries if any slip in here.
+        [ "$acct" = "root" ] && continue
+        echo "--- Enabling shell access for account: $acct ---"
+        whmapi1 modifyacct user="$acct" HASSHELL=1 2>&1 | tail -n 5
+    done
+else
+    echo "[WARN] /var/cpanel/users not found, skipping per-account shell access."
+fi
+
+echo "cPanel Terminal should now be visible under cPanel >> Advanced >> Terminal"
+echo "for accounts with shell access enabled."
+echo "NOTE: newly-created accounts get their shell-access setting from the"
+echo "      hosting package they're created with, not from this one-time run -"
+echo "      set 'Shell Access' in WHM >> Packages if you want it on by default"
+echo "      for future accounts too."
+
+# ---------------------------------------------------------------------------
+# 2) Enable Backups: Daily / Weekly / Monthly, 1 copy each
+# ---------------------------------------------------------------------------
+echo
+echo "== [2/11] Configuring cPanel Backups =="
+whmapi1 backup_config_set \
+    backupenable=1 \
+    backuptype=compressed \
+    backupfiles=1 \
+    backupmysql=1 \
+    backupaccts=1 \
+    backup_daily_enable=1 \
+    backup_daily_retention=1 \
+    backupdays="1,2,3,4,5,6,0" \
+    backup_weekly_enable=1 \
+    backup_weekly_day=6 \
+    backup_weekly_retention=1 \
+    backup_monthly_enable=1 \
+    backup_monthly_dates=1 \
+    backup_monthly_retention=1
+
+echo "Backups configured: Daily/Weekly/Monthly enabled, retention = 1 copy each."
+echo "NOTE: verify the backup destination/directory from WHM >> Backup Configuration"
+echo "      (BACKUPDIR) - this script does not change the storage destination."
+
+# ---------------------------------------------------------------------------
+# 3) Install & enable CSF (ConfigServer Security & Firewall)
+# ---------------------------------------------------------------------------
+echo
+echo "== [3/11] Installing CSF =="
+if [ -d /etc/csf ]; then
+    echo "CSF already installed, skipping install, will just re-enable it."
+else
+    cd /usr/src || exit 1
+    rm -rf csf csf.tgz
+
+    CSF_URLS=(
+        "https://download.configserver.com/csf.tgz"
+        "https://download.configserver.dev/csf.tgz"
+        "http://download.configserver.com/csf.tgz"
+    )
+
+    for url in "${CSF_URLS[@]}"; do
+        echo "Trying to download CSF from: $url"
+        wget -q --timeout=20 --tries=2 "$url" -O csf.tgz
+        if [ -s csf.tgz ]; then
+            echo "Downloaded CSF successfully from $url"
+            break
+        fi
+        rm -f csf.tgz
+    done
+
+    if [ ! -s csf.tgz ]; then
+        echo "[ERROR] Failed to download csf.tgz from all mirrors." >&2
+        echo "[ERROR] Check outbound network/firewall (port 80/443 egress) and DNS resolution." >&2
+        echo "[ERROR] You can install CSF manually later with:" >&2
+        echo "        cd /usr/src && wget https://download.configserver.com/csf.tgz && tar -xzf csf.tgz && cd csf && sh install.sh" >&2
+    else
+        tar -xzf csf.tgz
+        cd csf || exit 1
+        sh install.sh
+    fi
+fi
+
+if [ -f /etc/csf/csf.conf ]; then
+    sed -i 's/^TESTING = "1"/TESTING = "0"/' /etc/csf/csf.conf
+    systemctl enable csf lfd 2>/dev/null
+    systemctl restart lfd 2>/dev/null
+    csf -r
+    echo "CSF installed, TESTING mode disabled, csf/lfd enabled and restarted."
+else
+    echo "[WARN] CSF config not found at /etc/csf/csf.conf - install did not complete."
+    echo "[WARN] Re-run step 3 manually once network access to configserver.com is confirmed."
+fi
+
+# ---------------------------------------------------------------------------
+# 4) Install every available PHP version (EasyApache4) + common extensions
+# ---------------------------------------------------------------------------
+echo
+echo "== [4/11] Installing all EasyApache4 PHP versions =="
+
+# cPanel/EA4 needs an up-to-date version and a fresh repo cache before newer
+# PHP builds (8.4, 8.5) show up at all. ea-php84 has been in EA4 since Dec
+# 2024 and ea-php85 (GA) since EA4 v25.37 - if they're missing below, this is
+# almost always a stale cPanel/EA4 build or stale yum cache, not this script.
+echo "--- Updating cPanel & WHM and refreshing EA4/yum repo metadata first ---"
+/scripts/upcp --now 2>&1 | tail -n 30
+yum clean all 2>/dev/null
+yum makecache 2>/dev/null
+/usr/local/cpanel/scripts/build_local_repo_conf 2>/dev/null
+
+PHP_VERSIONS=$(repoquery --repoid=EA4 --queryformat="%{name}" 2>/dev/null | grep -Eoh "ea-php[0-9]{2,3}" | sort -u)
+
+if [ -z "$PHP_VERSIONS" ]; then
+    echo "[WARN] Could not list PHP versions via repoquery, falling back to yum list."
+    PHP_VERSIONS=$(yum list available 2>/dev/null | grep -Eoh "^ea-php[0-9]{2,3}\." | sed 's/\.$//' | sort -u)
+fi
+
+echo "PHP versions found in EA4 repo after refresh: $PHP_VERSIONS"
+
+# Explicitly force-attempt php84/php85 install and report exactly why they
+# succeeded/failed, instead of only relying on repoquery's list.
+for wanted in ea-php84 ea-php85; do
+    echo "--- Explicitly attempting to install ${wanted} ---"
+    if yum install -y "${wanted}" "${wanted}-meta" 2>&1 | tail -n 15; then
+        :
+    fi
+    if rpm -q "${wanted}" >/dev/null 2>&1; then
+        echo "  -> ${wanted}: INSTALLED successfully."
+        PHP_VERSIONS=$(printf '%s\n%s\n' "$PHP_VERSIONS" "$wanted" | sort -u)
+    else
+        echo "  -> ${wanted}: NOT installed."
+        echo "     Most common causes on cPanel:"
+        echo "       1. cPanel & WHM build is older than the release that added"
+        echo "          this PHP version - check WHM >> cPanel Update Preferences"
+        echo "          and run: /scripts/upcp --now"
+        echo "       2. EA4/yum repo cache is stale - this script already ran"
+        echo "          'yum clean all && yum makecache', but a full"
+        echo "          '/scripts/easyapache4 --unlock' + retry may be needed."
+        echo "       3. Your license/profile restricts available packages -"
+        echo "          check WHM >> EasyApache 4 >> PHP tab directly to confirm"
+        echo "          whether ${wanted} appears as installable there."
+    fi
+done
+
+# Extensions installed for every PHP version found above.
+EXT_LIST="php-cli php-common php-mysqlnd php-mbstring php-xml php-curl php-gd php-zip php-opcache php-intl php-soap php-bcmath php-imap php-fileinfo php-sockets php-pdo php-gmp php-calendar php-pgsql php-memcached php-snmp php-dba php-iconv php-pspell php-process php-ldap php-bz2 php-gettext php-tidy php-exif php-enchant php-dbg php-odbc php-xmlrpc php-sodium php-fpm php-phalcon"
+
+for ver in $PHP_VERSIONS; do
+    echo "--- Installing $ver + extensions ---"
+    pkgs="$ver"
+    for ext in $EXT_LIST; do
+        pkgs="$pkgs ${ver}-${ext}"
+    done
+    # Install what exists; yum will skip/report packages that don't exist for
+    # this particular PHP version instead of aborting the whole batch.
+    yum install -y $pkgs
+done
+
+/usr/local/cpanel/scripts/build_local_repo_conf 2>/dev/null
+whmapi1 php_get_installable_versions >/dev/null 2>&1
+
+echo "PHP installation step complete."
+
+# ---------------------------------------------------------------------------
+# 4b) Install Imagick and Redis extensions via PECL for every PHP version
+#     (these are not shipped as ea-phpXX-php-imagick / -redis packages in the
+#     base EA4 repo, so PECL is the standard/supported install path)
+# ---------------------------------------------------------------------------
+echo
+echo "== [4b/11] Installing Imagick + Redis PECL extensions for every PHP version =="
+
+# ImageMagick dev headers are required to compile the imagick PECL module.
+yum install -y ImageMagick ImageMagick-devel gcc make 2>/dev/null
+
+for ver in $PHP_VERSIONS; do
+    PECL_BIN="/opt/cpanel/${ver}/root/usr/bin/pecl"
+    PHP_BIN="/opt/cpanel/${ver}/root/usr/bin/php"
+    INI_DIR="/opt/cpanel/${ver}/root/etc/php.d"
+
+    if [ ! -x "$PECL_BIN" ]; then
+        echo "[WARN] $PECL_BIN not found, skipping imagick/redis for $ver."
+        continue
+    fi
+
+    mkdir -p "$INI_DIR"
+    echo "--- $ver: installing imagick via pecl ---"
+    yes '' | "$PECL_BIN" install imagick 2>&1 | tail -n 20
+    if [ -f "${INI_DIR}/imagick.ini" ]; then
+        :
+    else
+        echo "extension=imagick.so" > "${INI_DIR}/zz-imagick.ini"
+    fi
+
+    echo "--- $ver: installing redis via pecl ---"
+    yes '' | "$PECL_BIN" install redis 2>&1 | tail -n 20
+    if [ -f "${INI_DIR}/redis.ini" ]; then
+        :
+    else
+        echo "extension=redis.so" > "${INI_DIR}/zz-redis.ini"
+    fi
+
+    "$PHP_BIN" -m 2>/dev/null | grep -qi imagick && echo "    imagick: OK for $ver" || echo "    [WARN] imagick did not load for $ver, check pecl output above."
+    "$PHP_BIN" -m 2>/dev/null | grep -qi redis && echo "    redis:   OK for $ver" || echo "    [WARN] redis did not load for $ver, check pecl output above."
+done
+
+echo "NOTE: ionCube Loader and SourceGuardian Loader are NOT installed by this"
+echo "      script - they are proprietary binary loaders (not normal PHP"
+echo "      extensions/yum packages) and must be installed per the vendor's"
+echo "      own installer for each PHP version if needed."
+
+# ---------------------------------------------------------------------------
+# 4c) Install Node.js (via EA4 ea-nodejsXX packages) + npm + common global
+#     npm tooling, and make sure cPanel's "Setup Node.js App" (Application
+#     Manager) has runtimes to offer users.
+# ---------------------------------------------------------------------------
+echo
+echo "== [4c/11] Installing Node.js + npm (EasyApache4 ea-nodejs packages) =="
+
+NODE_PKGS=$(repoquery --repoid=EA4 --queryformat="%{name}" 2>/dev/null | grep -Eoh "ea-nodejs[0-9]+" | sort -u)
+if [ -z "$NODE_PKGS" ]; then
+    NODE_PKGS=$(yum list available 2>/dev/null | grep -Eoh "^ea-nodejs[0-9]+\." | sed 's/\.$//' | sort -u)
+fi
+
+echo "Node.js runtimes found in EA4 repo: $NODE_PKGS"
+
+if [ -z "$NODE_PKGS" ]; then
+    echo "[WARN] No ea-nodejsXX packages found in the EA4 repo - Node.js Selector"
+    echo "[WARN] runtimes need to come from EasyApache4, same caveat as PHP above"
+    echo "[WARN] (stale cPanel/EA4 build/cache). Falling back to installing"
+    echo "[WARN] system Node.js via NodeSource so 'node'/'npm' are at least"
+    echo "[WARN] available on the shell."
+    curl -fsSL https://rpm.nodesource.com/setup_lts.x 2>/dev/null | bash - 2>/dev/null
+    yum install -y nodejs 2>/dev/null
+else
+    for pkg in $NODE_PKGS; do
+        echo "--- Installing $pkg ---"
+        yum install -y "$pkg" 2>&1 | tail -n 15
+    done
+fi
+
+# Make the newest installed EA4 Node.js runtime available as 'node'/'npm' on
+# the shell PATH via cPanel's own wrapper if present.
+NEWEST_NODE=$(echo "$NODE_PKGS" | sed -E 's/ea-nodejs//' | sort -n | tail -1)
+if [ -n "$NEWEST_NODE" ] && [ -x "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/node" ]; then
+    ln -sf "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/node" /usr/local/bin/node
+    ln -sf "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/npm" /usr/local/bin/npm
+    ln -sf "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/npx" /usr/local/bin/npx
+    echo "Linked node/npm/npx (ea-nodejs${NEWEST_NODE}) into /usr/local/bin."
+fi
+
+if command -v node >/dev/null 2>&1; then
+    echo "node version: $(node -v 2>/dev/null)"
+fi
+if command -v npm >/dev/null 2>&1; then
+    echo "npm version:  $(npm -v 2>/dev/null)"
+    echo "--- Installing common global npm tooling (pm2, yarn) ---"
+    npm install -g pm2 yarn 2>&1 | tail -n 15
+else
+    echo "[WARN] npm not found on PATH after install - Node.js install likely failed above."
+fi
+
+echo "NOTE: cPanel's 'Setup Node.js App' (Application Manager) in cPanel's UI"
+echo "      will now list every ea-nodejsXX runtime installed above as a"
+echo "      selectable version for end users' own Node.js applications."
+
+# ---------------------------------------------------------------------------
+# 5) Disable dangerous PHP functions in EVERY installed PHP version
+# ---------------------------------------------------------------------------
+echo
+echo "== [5/11] Disabling risky PHP functions in all installed versions =="
+
+DISABLE_FUNCS="dl,exec,system,shell_exec,passthru,popen,proc_open,proc_close,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,escapeshellcmd,escapeshellarg,posix_kill,posix_setuid,posix_setgid,posix_setsid,posix_setpgid,posix_mknod,posix_seteuid,posix_setegid,apache_child_terminate,apache_setenv,apache_note,ini_restore,define_syslog_variables,openlog,syslog,closelog,leak,listen,virtual,show_source"
+
+for ini in /opt/cpanel/ea-php*/root/etc/php.ini; do
+    [ -f "$ini" ] || continue
+    echo "--- Updating $ini ---"
+    cp -a "$ini" "${ini}.bak_$(date +%Y%m%d%H%M%S)"
+    if grep -q '^disable_functions' "$ini"; then
+        sed -i "s/^disable_functions.*/disable_functions = ${DISABLE_FUNCS}/" "$ini"
+    else
+        echo "disable_functions = ${DISABLE_FUNCS}" >> "$ini"
+    fi
+done
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+echo "disable_functions applied to all php.ini files found under /opt/cpanel/."
+
+# ---------------------------------------------------------------------------
+# 5b) Apply custom PHP resource-limit directives to EVERY installed PHP
+#     version's php.ini (values as explicitly requested - NOTE these are
+#     extremely high compared to PHP defaults, see warnings below).
+# ---------------------------------------------------------------------------
+echo
+echo "== [5b/11] Applying custom PHP ini limits to all installed PHP versions =="
+echo "[WARN] memory_limit=12800000M and max_execution_time=3000000s are far"
+echo "[WARN] above normal production values. A single runaway script can now"
+echo "[WARN] consume effectively unlimited RAM and run for over a month"
+echo "[WARN] without being killed. Proceeding because this was explicitly"
+echo "[WARN] confirmed, but monitor server load/memory closely after this."
+
+set_php_directive() {
+    local ini="$1" key="$2" value="$3"
+    if grep -qE "^[; ]*${key}[[:space:]]*=" "$ini"; then
+        sed -i -E "s|^[; ]*${key}[[:space:]]*=.*|${key} = ${value}|" "$ini"
+    else
+        echo "${key} = ${value}" >> "$ini"
+    fi
+}
+
+for ini in /opt/cpanel/ea-php*/root/etc/php.ini; do
+    [ -f "$ini" ] || continue
+    echo "--- Updating PHP limits in $ini ---"
+    cp -a "$ini" "${ini}.bak_$(date +%Y%m%d%H%M%S)"
+
+    set_php_directive "$ini" "max_execution_time" "3000000"
+    set_php_directive "$ini" "max_input_time" "6000000"
+    set_php_directive "$ini" "max_input_vars" "100000"
+    set_php_directive "$ini" "memory_limit" "12800000M"
+    set_php_directive "$ini" "post_max_size" "800M"
+    set_php_directive "$ini" "upload_max_filesize" "200M"
+done
+
+# Also push the same values through WHM's MultiPHP INI Editor API so they
+# show up correctly in WHM's UI (per PHP version) and aren't just raw
+# php.ini edits that WHM might later overwrite.
+for ver in $PHP_VERSIONS; do
+    whmapi1 php_ini_set_directives \
+        version="$ver" \
+        max_execution_time=3000000 \
+        max_input_time=6000000 \
+        max_input_vars=100000 \
+        memory_limit=12800000M \
+        post_max_size=800M \
+        upload_max_filesize=200M \
+        2>/dev/null
+done
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+echo "Custom PHP limits applied to all php.ini files and via WHM MultiPHP INI Editor."
+
+# ---------------------------------------------------------------------------
+# 6) Run /scripts/securetmp
+# ---------------------------------------------------------------------------
+echo
+echo "== [6/11] Running /scripts/securetmp =="
+if [ -x /scripts/securetmp ]; then
+    /scripts/securetmp
+else
+    echo "[WARN] /scripts/securetmp not found or not executable."
+fi
+
+# ---------------------------------------------------------------------------
+# 7) Enable cPHulk Brute Force Protection
+# ---------------------------------------------------------------------------
+echo
+echo "== [7/11] Enabling cPHulk Brute Force Protection =="
+whmapi1 enable_cphulk
+whmapi1 save_cphulk_config \
+    ip_based_protection=1 \
+    block_brute_force_with_firewall=1 \
+    block_excessive_brute_force_with_firewall=1 \
+    ip_brute_force_period_mins=15 \
+    lookback_period_min=360 \
+    mark_as_brute=30
+
+echo "cPHulk enabled with firewall-based blocking for brute force attempts."
+echo "IMPORTANT: whitelist your own admin IP(s) in WHM >> cPHulk Brute Force Protection >> Whitelist Management"
+echo "           to avoid locking yourself out."
+
+# ---------------------------------------------------------------------------
+# 8) Install & enable ModSecurity + OWASP Core Rule Set
+# ---------------------------------------------------------------------------
+echo
+echo "== [8/11] Installing ModSecurity + OWASP CRS =="
+
+if ! rpm -qa | grep -q ea-apache24-mod_security2; then
+    yum install -y ea-apache24-mod_security2
+fi
+
+yum install -y ea-modsec2-rules-owasp-crs
+
+if [ -f /etc/apache2/conf.d/modsec2.conf ]; then
+    sed -i 's/^SecRuleEngine.*/SecRuleEngine On/' /etc/apache2/conf.d/modsec2.conf 2>/dev/null
+fi
+
+whmapi1 modsec_configure enabled=1 2>/dev/null
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+echo "ModSecurity + OWASP CRS installed and enabled (SecRuleEngine On)."
+echo "NOTE: OWASP CRS can occasionally flag legitimate traffic (false positives)."
+echo "      Monitor WHM >> Security Center >> ModSecurity Tools for the first few days"
+echo "      and add per-site exceptions there if a real site gets blocked."
+
+# ---------------------------------------------------------------------------
+# 9) Root SSH key setup
+# ---------------------------------------------------------------------------
+echo
+echo "== [9/11] Setting up root SSH key access =="
+
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+if [ ! -f /root/.ssh/id_rsa ]; then
+    ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N "" -C "root@$(hostname)"
+    echo "New local keypair generated: /root/.ssh/id_rsa / id_rsa.pub"
+else
+    echo "Local keypair already exists at /root/.ssh/id_rsa, skipping generation."
+fi
+
+PUBKEY='ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAsJAbH514tlSeiPoe84iSxfWCS1VQ2uEFC6h84pXt1Xne9V6d5TJ+1i35w8djPy+fiuSvgEx8DOtbK6+sQD2MXAXH9MUmj7ePT5XUgPRHgzoSpducxbn1prnxiNtj+TVJChC9j8sFK+hJKLpz9MvMsFqKRu0FqOIxl7cc11zQo/xD+3Lh+c+dYZBo90mS90tsmshy7Isz2FmVrTsyC4en3wauYm8xlOtabhC/W+bq3fzQVqSe+GoE3pIYdH11ow56+qHzuUxv027x2V+k63TvysTVic5WKLh1LjatkAZp4BxYffgsxU6wIRogJvG3F6hELnbLW90HYogaPeaQqzwX9Q== root@CentOS-69-64-minimal'
+
+if grep -qF "$PUBKEY" /root/.ssh/authorized_keys 2>/dev/null; then
+    echo "Provided public key already present in authorized_keys, skipping."
+else
+    echo "$PUBKEY" >> /root/.ssh/authorized_keys
+    echo "Provided public key appended to /root/.ssh/authorized_keys."
+fi
+
+echo "Reminder: this ONLY adds a public key for key-based login. It does not"
+echo "          disable password authentication."
+
+# ---------------------------------------------------------------------------
+# 10) Change SSH port to 2649 and allow it in CSF
+# ---------------------------------------------------------------------------
+echo
+echo "== [10/11] Changing SSH port to 2649 and allowing it in CSF =="
+
+NEW_SSH_PORT=2649
+
+# Allow the new port in CSF BEFORE touching sshd, so it's never blocked
+if [ -f /etc/csf/csf.conf ]; then
+    for DIR in TCP_IN TCP_OUT; do
+        CURRENT=$(grep "^${DIR} = " /etc/csf/csf.conf | sed -E "s/^${DIR} = \"(.*)\"/\1/")
+        if [[ ",${CURRENT}," != *",${NEW_SSH_PORT},"* ]]; then
+            sed -i "s/^${DIR} = \"\(.*\)\"/${DIR} = \"\1,${NEW_SSH_PORT}\"/" /etc/csf/csf.conf
+        fi
+    done
+    csf -r
+    echo "Port ${NEW_SSH_PORT} added to CSF TCP_IN/TCP_OUT and firewall reloaded."
+else
+    echo "[WARN] /etc/csf/csf.conf not found - CSF port rule NOT added."
+    echo "[WARN] Since CSF is not installed on this run, there is no firewall"
+    echo "[WARN] rule blocking the new SSH port anyway - but install CSF (step 3)"
+    echo "[WARN] and re-run this script, or add the port to your firewall of"
+    echo "[WARN] choice manually, before you rely on it being open long-term."
+fi
+
+# Update sshd_config
+if grep -q "^Port " /etc/ssh/sshd_config; then
+    sed -i "s/^Port .*/Port ${NEW_SSH_PORT}/" /etc/ssh/sshd_config
+else
+    echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
+fi
+sed -i "s/^Port 22$/#Port 22/" /etc/ssh/sshd_config 2>/dev/null
+
+# Keep cPanel's chkservd service monitor in sync so it doesn't flag sshd as down
+if [ -f /etc/chkserv.d/sshd ]; then
+    sed -i "s/^sshd:.*/sshd:${NEW_SSH_PORT}/" /etc/chkserv.d/sshd
+fi
+
+# SELinux: allow sshd to bind the new port if SELinux is enforcing
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ] && command -v semanage >/dev/null 2>&1; then
+    semanage port -a -t ssh_port_t -p tcp ${NEW_SSH_PORT} 2>/dev/null \
+      || semanage port -m -t ssh_port_t -p tcp ${NEW_SSH_PORT} 2>/dev/null
+fi
+
+# Apply the new sshd config
+sshd -t && (systemctl restart sshd 2>/dev/null || service sshd restart 2>/dev/null)
+/scripts/restartsrv_chkservd 2>/dev/null
+
+echo "SSH is now configured to listen on port ${NEW_SSH_PORT}."
+echo "!!! DO NOT CLOSE THIS SESSION !!!"
+echo "Open a NEW terminal and test: ssh -p ${NEW_SSH_PORT} root@<server-ip>"
+echo "Only close this current session after that new connection succeeds."
+echo "Also remember: if this server sits behind a cloud/VPS provider firewall"
+echo "(security group, network ACL, etc.) you must open port ${NEW_SSH_PORT} there too."
+
+###############################################################################
+# 11) Append custom banner/security code to /root/.bash_profile
+###############################################################################
+echo
+echo "== [11/11] Updating /root/.bash_profile =="
+
+BASH_PROFILE="/root/.bash_profile"
+if [ -f "$BASH_PROFILE" ]; then
+    cp -a "$BASH_PROFILE" "${BASH_PROFILE}.bak_$(date +%Y%m%d%H%M%S)"
+fi
+
+if grep -q "GlobalIws.com Security Aria" "$BASH_PROFILE" 2>/dev/null; then
+    echo "Banner already present in $BASH_PROFILE - skipping append."
+else
+cat >> "$BASH_PROFILE" << 'EOF'
+
+# .bash_profile
+
+# Get the aliases and functions
+if [ -f ~/.bashrc ]; then
+        . ~/.bashrc
+fi
+
+# User specific environment and startup programs
+
+PATH=$PATH:$HOME/bin
+export PATH
+
+#############################################################################
+
+ eval "`dircolors`"
+
+ #############################################################################
+
+ alias ls='ls $LS_OPTIONS'
+ alias ll='ls $LS_OPTIONS -l'
+ alias l='ls $LS_OPTIONS -lA'
+ alias ..='cd ..'
+ alias ...='cd ../..'
+ alias s='ssh -l root'
+
+ #############################################################################
+
+ export EDITOR="nano"
+
+export HISTFILESIZE=99999999
+ export HISTSIZE=99999999
+ export HISTCONTROL="ignoreboth"
+
+ export LS_OPTIONS='--color=auto -h'
+
+ #############################################################################
+
+# trap  SIGINT
+ function ask()
+ {
+# clear
+ GREEN='\033[01;32m'
+ DGREEN='\033[01;32m'
+ DYELLOW='\033[01;33m'
+ echo -e "$DYELLOW Welcome to GlobalIws.com Security Aria "
+ echo "Have A Nice Day."
+ echo "Please Be careful to use this server "
+ echo -e "$DYELLOW SSH Access is Not Available for non- staff "
+ echo -e "$GREEN Enter Security Key to Continue: "
+ stty -echo
+ read ans
+ stty echo
+ if [ ! "$ans" = "GlobalIws.comGIT" ] ; then
+ exit
+ else
+ clear
+ echo ""
+ echo "========================================="
+ echo "GlobalIWS Network 2027 $(cat /etc/redhat-release)"
+ echo "========================================="
+ echo ""
+ echo "kernel : `uname -r`"
+ echo "hostname  : `hostname`"
+ echo "Server IP : `hostname -i`"
+ echo ""
+ fi
+ }
+ ask
+
+ export PS1='\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;36m\]\H \[\033[01;33m\]\w \[\033[01;35m\]GlobalIWS-2027# \[\033[00m\]'
+ export HISTTIMEFORMAT="%h/%d - %H:%M:%S "
+
+echo 'ALERT - Root Shell Access (server.globaliws.com) on:' `date` `who` | mail -s "Alert: Root Access from `who | cut -d"(" -f2 | cut -d")" -f1`" linux.system25@gmail.com
+EOF
+    echo "Banner appended to $BASH_PROFILE (backup saved)."
+fi
+
+echo
+echo "=================================================================="
+echo " Finished $(date)"
+echo " Full log saved at: $LOG"
+echo "=================================================================="
+echo "Reminders:"
+echo " - Whitelist your admin IP in /etc/csf/csf.allow AND in WHM >> cPHulk Whitelist Management."
+echo " - Watch ModSecurity Tools for false positives for a few days after enabling."
+echo " - Verify backup destination (BACKUPDIR) in WHM >> Backup Configuration."
+echo " - Confirm mail/sendmail works so the root-login alert email actually delivers."
+echo " - Test SSH login on the new port (2649) from a NEW session before closing this one."
+echo " - Confirm imagick/redis loaded: php -m | grep -Ei 'imagick|redis' for each PHP version."
