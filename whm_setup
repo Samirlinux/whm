@@ -448,7 +448,7 @@ echo "Custom PHP limits applied to all php.ini files and via WHM MultiPHP INI Ed
 echo
 echo "== [6/11] Running /scripts/securetmp =="
 if [ -x /scripts/securetmp ]; then
-    /scripts/securetmp
+    /scripts/securetmp --auto
 else
     echo "[WARN] /scripts/securetmp not found or not executable."
 fi
