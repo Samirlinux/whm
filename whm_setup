@@ -309,12 +309,16 @@ echo "      extensions/yum packages) and must be installed per the vendor's"
 echo "      own installer for each PHP version if needed."
 
 # ---------------------------------------------------------------------------
-# 4c) Install Node.js (via EA4 ea-nodejsXX packages) + npm + common global
-#     npm tooling, and make sure cPanel's "Setup Node.js App" (Application
-#     Manager) has runtimes to offer users.
+# 4c) Install Node.js (via EA4 ea-nodejsXX package) + npm + common global
+#     npm tooling. NOTE: unlike PHP, EA4's ea-nodejsXX packages CANNOT
+#     coexist - each one provides/owns the same "ea4-nodejs" system path and
+#     they hard-conflict with each other in yum/dnf. Only ONE version can be
+#     installed system-wide at a time, so we install just the newest one
+#     found, using --allowerasing to replace any older ea-nodejsXX already
+#     on the box instead of looping over every version like the PHP step.
 # ---------------------------------------------------------------------------
 echo
-echo "== [4c/11] Installing Node.js + npm (EasyApache4 ea-nodejs packages) =="
+echo "== [4c/11] Installing Node.js + npm (EasyApache4 ea-nodejs package) =="
 
 NODE_PKGS=$(repoquery --repoid=EA4 --queryformat="%{name}" 2>/dev/null | grep -Eoh "ea-nodejs[0-9]+" | sort -u)
 if [ -z "$NODE_PKGS" ]; then
@@ -323,7 +327,10 @@ fi
 
 echo "Node.js runtimes found in EA4 repo: $NODE_PKGS"
 
-if [ -z "$NODE_PKGS" ]; then
+# Pick the highest-numbered ea-nodejsXX (e.g. ea-nodejs22 over ea-nodejs10).
+NEWEST_NODE_PKG=$(echo "$NODE_PKGS" | sed -E 's/^ea-nodejs([0-9]+)$/\1 &/' | sort -n | awk '{print $2}' | tail -1)
+
+if [ -z "$NEWEST_NODE_PKG" ]; then
     echo "[WARN] No ea-nodejsXX packages found in the EA4 repo - Node.js Selector"
     echo "[WARN] runtimes need to come from EasyApache4, same caveat as PHP above"
     echo "[WARN] (stale cPanel/EA4 build/cache). Falling back to installing"
@@ -332,20 +339,19 @@ if [ -z "$NODE_PKGS" ]; then
     curl -fsSL https://rpm.nodesource.com/setup_lts.x 2>/dev/null | bash - 2>/dev/null
     yum install -y nodejs 2>/dev/null
 else
-    for pkg in $NODE_PKGS; do
-        echo "--- Installing $pkg ---"
-        yum install -y "$pkg" 2>&1 | tail -n 15
-    done
+    echo "--- Installing ${NEWEST_NODE_PKG} (newest EA4 Node.js runtime found) ---"
+    echo "    (any older ea-nodejsXX already installed will be replaced - they"
+    echo "     cannot be installed side-by-side, --allowerasing handles that)"
+    yum install -y --allowerasing "$NEWEST_NODE_PKG" 2>&1 | tail -n 20
 fi
 
-# Make the newest installed EA4 Node.js runtime available as 'node'/'npm' on
-# the shell PATH via cPanel's own wrapper if present.
-NEWEST_NODE=$(echo "$NODE_PKGS" | sed -E 's/ea-nodejs//' | sort -n | tail -1)
-if [ -n "$NEWEST_NODE" ] && [ -x "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/node" ]; then
-    ln -sf "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/node" /usr/local/bin/node
-    ln -sf "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/npm" /usr/local/bin/npm
-    ln -sf "/opt/cpanel/ea-nodejs${NEWEST_NODE}/bin/npx" /usr/local/bin/npx
-    echo "Linked node/npm/npx (ea-nodejs${NEWEST_NODE}) into /usr/local/bin."
+# Make the installed EA4 Node.js runtime available as 'node'/'npm' on the
+# shell PATH.
+if [ -n "$NEWEST_NODE_PKG" ] && [ -x "/opt/cpanel/${NEWEST_NODE_PKG}/bin/node" ]; then
+    ln -sf "/opt/cpanel/${NEWEST_NODE_PKG}/bin/node" /usr/local/bin/node
+    ln -sf "/opt/cpanel/${NEWEST_NODE_PKG}/bin/npm" /usr/local/bin/npm
+    ln -sf "/opt/cpanel/${NEWEST_NODE_PKG}/bin/npx" /usr/local/bin/npx
+    echo "Linked node/npm/npx (${NEWEST_NODE_PKG}) into /usr/local/bin."
 fi
 
 if command -v node >/dev/null 2>&1; then
@@ -359,9 +365,9 @@ else
     echo "[WARN] npm not found on PATH after install - Node.js install likely failed above."
 fi
 
-echo "NOTE: cPanel's 'Setup Node.js App' (Application Manager) in cPanel's UI"
-echo "      will now list every ea-nodejsXX runtime installed above as a"
-echo "      selectable version for end users' own Node.js applications."
+echo "NOTE: cPanel's 'Setup Node.js App' (Application Manager) manages its own"
+echo "      per-application Node.js virtual environments independently of the"
+echo "      single system-wide ${NEWEST_NODE_PKG:-Node.js} runtime installed here."
 
 # ---------------------------------------------------------------------------
 # 5) Disable dangerous PHP functions in EVERY installed PHP version
