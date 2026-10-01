@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  cPanel Backup Monitor
+#  Author  : Eng. Samir Abu El-Khair
+#  Version : 1.0
+#
+#  Daily checks (run it from cron):
+#    1) cPanel/WHM internal backup   - fresh? complete? disk space?
+#    2) JetBackup 5                  - backup runs OK? external copy really taken?
+#    3) Git backup                   - committed AND pushed to the external remote?
+#    4) Extra backups (optional)     - any other backup folders you list in the config
+#  Then sends one report to Email (Gmail/SMTP/sendmail) + Telegram + Slack.
+#
+#  Usage:
+#    ./backup-monitor.sh                 # settings: block at the top of this file (+ optional backup-monitor.conf)
+#    ./backup-monitor.sh -c /path/conf   # custom config file
+#    ./backup-monitor.sh --test          # only send a test notification
+# =============================================================================
+
+set -u
+export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
+
+VERSION="1.0"
+AUTHOR="Eng. Samir Abu El-Khair"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF_FILE="${SCRIPT_DIR}/backup-monitor.conf"
+TEST_ONLY="no"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--config)  CONF_FILE="$2"; shift 2 ;;
+    --test)       TEST_ONLY="yes"; shift ;;
+    -v|--version) echo "cPanel Backup Monitor v${VERSION} - ${AUTHOR}"; exit 0 ;;
+    -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+# =============================================================================
+#  CONFIGURATION  (edit this block on each server)
+#  Optional: any value can also be overridden in "backup-monitor.conf" placed
+#  next to this script, so you can update the script without touching settings.
+#  Do NOT commit real tokens/passwords to a public GitHub repo.
+# =============================================================================
+SERVER_NAME="auto"                 # auto = real hostname of this server
+LOG_FILE="/var/log/cpanel-backup-monitor.log"
+NOTIFY_ON="always"                 # always = daily report | failure = only on problems
+
+# --- 1) cPanel internal backup ---
+CHECK_CPANEL="yes"
+CPANEL_BACKUP_DIR="/backup"
+CPANEL_MAX_AGE_HOURS=26
+CPANEL_MIN_ACCOUNTS_PERCENT=95
+DISK_WARN_PERCENT=90
+CPANEL_REQUIRE_EXTERNAL="no"       # yes = FAIL if cPanel has no enabled remote destination
+
+# --- 2) JetBackup 5 ---
+CHECK_JETBACKUP="auto"             # auto (only if installed) | yes | no
+JETBACKUP_MAX_AGE_HOURS=26
+JETBACKUP_REQUIRE_EXTERNAL="yes"   # yes = FAIL if no job copies to an external destination
+
+# --- 3) Git backup ---
+CHECK_GIT="no"                     # set "yes" and fill GIT_REPO_DIR to enable
+GIT_REPO_DIR=""                    # e.g. /backup/git-backup
+GIT_REMOTE="origin"
+GIT_BRANCH="main"
+GIT_CHECK_COMMIT_AGE="yes"         # "no" if the repo only commits when files change
+GIT_MAX_AGE_HOURS=26
+
+# --- 4) Extra backups, format: "Name|/path|max_age_hours" ---
+EXTRA_BACKUPS=(
+  # "MySQL dumps|/backup/mysql|26"
+)
+
+# --- Email (Gmail: use an App Password) ---
+EMAIL_ENABLED="yes"
+EMAIL_METHOD="smtp"                # smtp (Gmail) | sendmail (local server mail)
+EMAIL_TO=""                        # one or more, comma separated
+EMAIL_FROM="backup-monitor@$(hostname -f 2>/dev/null || hostname)"   # sendmail mode only
+SMTP_HOST="smtp.gmail.com"; SMTP_PORT=465   # use 587 if 465 is blocked
+SMTP_USER=""                       # your Gmail address
+SMTP_PASS=""                       # Gmail App Password (16 chars)
+
+# --- Telegram ---
+TELEGRAM_ENABLED="yes"
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+
+# --- Slack (webhook OR bot token + channel id) ---
+SLACK_ENABLED="yes"
+SLACK_WEBHOOK_URL=""
+SLACK_BOT_TOKEN=""
+SLACK_CHANNEL_ID="C0C58906WGL"
+
+# ---- optional override file next to the script ------------------------------
+if [[ -f "$CONF_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+fi
+
+# SERVER_NAME="auto" (or empty) -> use the real hostname of this server
+if [[ -z "${SERVER_NAME:-}" || "$SERVER_NAME" == "auto" ]]; then
+  SERVER_NAME="$(hostname -f 2>/dev/null || hostname)"
+fi
+
+# ------------------------------- Helpers -------------------------------------
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG_FILE" 2>/dev/null; }
+
+icon() { case "$1" in OK) echo "✅";; WARN) echo "⚠️";; *) echo "❌";; esac; }
+
+rank() { case "$1" in FAIL) echo 3;; WARN) echo 2;; OK) echo 1;; *) echo 0;; esac; }
+worse() { if (( $(rank "$2") > $(rank "$1") )); then echo "$2"; else echo "$1"; fi; }
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' \
+    | awk '{printf "%s\\n", $0}'
+}
+
+# Prevent overlapping runs
+exec 9>/tmp/cpanel-backup-monitor.lock
+flock -n 9 || { log "Another instance is running. Exit."; exit 0; }
+
+# ------------------------------ Notifications --------------------------------
+send_email() {
+  [[ "$EMAIL_ENABLED" == "yes" && -n "$EMAIL_TO" ]] || return 0
+  local msg from subj_enc out a scheme
+  msg="$(mktemp)"
+  from="$EMAIL_FROM"; [[ "$EMAIL_METHOD" == "smtp" ]] && from="$SMTP_USER"
+  subj_enc="=?UTF-8?B?$(printf '%s' "$SUBJECT" | base64 -w0)?="
+  {
+    echo "From: ${from}"
+    echo "To: ${EMAIL_TO}"
+    echo "Subject: ${subj_enc}"
+    echo "Date: $(date -R)"
+    echo "MIME-Version: 1.0"
+    echo "Content-Type: text/plain; charset=UTF-8"
+    echo "Content-Transfer-Encoding: base64"
+    echo
+    printf '%s\n' "$REPORT" | base64
+  } > "$msg"
+
+  if [[ "$EMAIL_METHOD" == "smtp" ]]; then
+    if [[ -z "$SMTP_USER" || -z "$SMTP_PASS" ]]; then log "Email: SMTP_USER/SMTP_PASS not set - skipped"; rm -f "$msg"; return 0; fi
+    local rcpt=() arr
+    IFS=',' read -ra arr <<< "$EMAIL_TO"
+    for a in "${arr[@]}"; do a="${a// /}"; [[ -n "$a" ]] && rcpt+=(--mail-rcpt "$a"); done
+    scheme="smtps"; [[ "$SMTP_PORT" != "465" ]] && scheme="smtp"
+    out=$(curl -sS -m 60 --ssl-reqd --url "${scheme}://${SMTP_HOST}:${SMTP_PORT}" \
+          --user "${SMTP_USER}:${SMTP_PASS}" --mail-from "$SMTP_USER" \
+          "${rcpt[@]}" --upload-file "$msg" 2>&1) \
+      && log "Email(SMTP): sent to ${EMAIL_TO}" || log "Email(SMTP): FAILED - ${out}"
+  else
+    local sm; sm="$(command -v sendmail || echo /usr/sbin/sendmail)"
+    if [[ ! -x "$sm" ]]; then log "Email: sendmail not found"; rm -f "$msg"; return 1; fi
+    "$sm" -t -oi < "$msg" && log "Email: sent to ${EMAIL_TO}" || log "Email: FAILED"
+  fi
+  rm -f "$msg"
+}
+
+send_telegram() {
+  [[ "$TELEGRAM_ENABLED" == "yes" && -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]] || return 0
+  local resp
+  resp=$(curl -sS -m 30 -X POST \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d chat_id="$TELEGRAM_CHAT_ID" \
+    --data-urlencode text="$SUBJECT
+$REPORT" 2>&1)
+  if echo "$resp" | grep -q '"ok":true'; then log "Telegram: sent"; else log "Telegram: FAILED - $resp"; fi
+}
+
+send_slack() {
+  [[ "$SLACK_ENABLED" == "yes" ]] || return 0
+  local payload resp text
+  text="$(json_escape "$SUBJECT
+$REPORT")"
+  if [[ -n "$SLACK_BOT_TOKEN" && -n "$SLACK_CHANNEL_ID" ]]; then
+    payload="{\"channel\":\"${SLACK_CHANNEL_ID}\",\"text\":\"${text}\"}"
+    resp=$(curl -sS -m 30 -X POST https://slack.com/api/chat.postMessage \
+      -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+      -H 'Content-Type: application/json; charset=utf-8' \
+      --data "$payload" 2>&1)
+    if echo "$resp" | grep -q '"ok":true'; then log "Slack: sent (bot)"; else log "Slack: FAILED - $resp"; fi
+  elif [[ -n "$SLACK_WEBHOOK_URL" ]]; then
+    payload="{\"text\":\"${text}\"}"
+    resp=$(curl -sS -m 30 -X POST -H 'Content-Type: application/json' \
+      --data "$payload" "$SLACK_WEBHOOK_URL" 2>&1)
+    if [[ "$resp" == "ok" ]]; then log "Slack: sent (webhook)"; else log "Slack: FAILED - $resp"; fi
+  else
+    log "Slack: enabled but no webhook or bot token configured"
+  fi
+}
+
+notify_all() { send_email; send_telegram; send_slack; }
+
+if [[ "$TEST_ONLY" == "yes" ]]; then
+  SUBJECT="[TEST] Backup Monitor - ${SERVER_NAME}"
+  REPORT="This is a test notification from cPanel Backup Monitor v${VERSION} ✅"
+  notify_all
+  echo "Test notification sent. Check ${LOG_FILE} for details."
+  exit 0
+fi
+
+# ------------------------- Check 1: cPanel internal backup -------------------
+CP_STATUS="SKIP"; CP_DETAILS=""
+
+check_cpanel() {
+  CP_STATUS="OK"; CP_DETAILS=""
+  local d=""
+
+  if [[ ! -d "$CPANEL_BACKUP_DIR" ]]; then
+    CP_STATUS="FAIL"
+    CP_DETAILS="Backup directory not found: ${CPANEL_BACKUP_DIR} (drive not mounted or backups disabled?)"
+    return
+  fi
+
+  local name latest
+  name=$(ls -1 "$CPANEL_BACKUP_DIR" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -n1)
+  if [[ -n "$name" ]]; then
+    latest="${CPANEL_BACKUP_DIR}/${name}"
+  elif [[ -d "${CPANEL_BACKUP_DIR}/cpbackup/daily" ]]; then
+    latest="${CPANEL_BACKUP_DIR}/cpbackup/daily"
+  else
+    CP_STATUS="FAIL"
+    CP_DETAILS="No backup folders found in ${CPANEL_BACKUP_DIR}"
+    return
+  fi
+
+  local acc_dir="$latest"
+  [[ -d "${latest}/accounts" ]] && acc_dir="${latest}/accounts"
+
+  local newest now age_h backed total pct
+  newest=$(find "$acc_dir" -mindepth 1 -maxdepth 1 -printf '%T@\n' 2>/dev/null | sort -n | tail -n1 | cut -d. -f1)
+  now=$(date +%s)
+  if [[ -z "$newest" ]]; then
+    CP_STATUS="FAIL"
+    CP_DETAILS="Latest backup folder is empty: ${latest}"
+    return
+  fi
+  age_h=$(( (now - newest) / 3600 ))
+
+  backed=$(find "$acc_dir" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+  total=$(ls -1 /var/cpanel/users 2>/dev/null | grep -Ev '^(root|nobody|system|cpanel)$' | wc -l)
+  pct=100
+  [[ "$total" -gt 0 ]] && pct=$(( backed * 100 / total ))
+  (( pct > 100 )) && pct=100
+
+  d+="Folder    : ${latest}"$'\n'
+  d+="Last file : ${age_h}h ago"$'\n'
+  d+="Accounts  : ${backed} backed up / ${total} on server (${pct}%)"$'\n'
+
+  if (( age_h > CPANEL_MAX_AGE_HOURS )); then
+    CP_STATUS="FAIL"
+    d+="Problem   : backup is older than ${CPANEL_MAX_AGE_HOURS}h"$'\n'
+  fi
+  if (( pct < CPANEL_MIN_ACCOUNTS_PERCENT )); then
+    CP_STATUS="FAIL"
+    d+="Problem   : only ${pct}% of accounts backed up (minimum ${CPANEL_MIN_ACCOUNTS_PERCENT}%)"$'\n'
+  fi
+
+  if pgrep -f 'cpanel/bin/backup' >/dev/null 2>&1; then
+    d+="Note      : a cPanel backup is running right now (result may be incomplete)"$'\n'
+    [[ "$CP_STATUS" == "FAIL" ]] && CP_STATUS="WARN"
+  fi
+
+  local used
+  used=$(df -P "$CPANEL_BACKUP_DIR" 2>/dev/null | awk 'NR==2{gsub("%","",$5);print $5}')
+  if [[ -n "$used" ]]; then
+    d+="Disk use  : ${used}% on the backup partition"$'\n'
+    if (( used >= DISK_WARN_PERCENT )); then
+      d+="Warning   : backup disk is almost full"$'\n'
+      [[ "$CP_STATUS" == "OK" ]] && CP_STATUS="WARN"
+    fi
+  fi
+
+  # cPanel remote (additional) destinations
+  if command -v whmapi1 >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    local extn
+    extn=$(whmapi1 backup_destination_list --output=json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    l = json.load(sys.stdin)["data"]["destination_list"]
+    print(len([x for x in l if not x.get("disabled") and str(x.get("type","")).lower() != "local"]))
+except Exception:
+    print("?")' 2>/dev/null)
+    if [[ "$extn" =~ ^[0-9]+$ ]]; then
+      d+="Remote destinations (cPanel) : ${extn} enabled"$'\n'
+      if [[ "$extn" -eq 0 && "$CPANEL_REQUIRE_EXTERNAL" == "yes" ]]; then
+        CP_STATUS="FAIL"
+        d+="Problem   : cPanel has no enabled remote destination (no external copy)"$'\n'
+      fi
+    fi
+  fi
+
+  CP_DETAILS="$d"
+}
+
+# ------------------------- Check 2: JetBackup 5 ------------------------------
+JB_STATUS="SKIP"; JB_DETAILS=""
+
+check_jetbackup() {
+  JB_STATUS="OK"; JB_DETAILS=""
+  local bin tmp res
+  bin="$(command -v jetbackup5api 2>/dev/null || true)"
+  [[ -z "$bin" && -x /usr/bin/jetbackup5api ]] && bin="/usr/bin/jetbackup5api"
+
+  if [[ -z "$bin" ]]; then
+    if [[ "$CHECK_JETBACKUP" == "yes" ]]; then
+      JB_STATUS="FAIL"; JB_DETAILS="JetBackup 5 CLI (jetbackup5api) not found on this server"
+    else
+      JB_STATUS="SKIP"   # auto mode: not installed -> silently skipped
+    fi
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    JB_STATUS="WARN"; JB_DETAILS="python3 is required to read JetBackup output (yum/dnf install python3)"
+    return
+  fi
+
+  tmp="$(mktemp -d)"
+  timeout 120 "$bin" -F listQueueGroups -D "type=1&limit=500&sort[created]=-1" -O json > "$tmp/groups.json" 2>/dev/null
+  timeout 120 "$bin" -F listBackupJobs -O json > "$tmp/jobs.json" 2>/dev/null
+  timeout 180 "$bin" -F listBackups -D "type=127&limit=2000&sort[created]=-1" -O json > "$tmp/backups.json" 2>/dev/null
+
+  res=$(python3 - "$tmp" "$JETBACKUP_MAX_AGE_HOURS" "$JETBACKUP_REQUIRE_EXTERNAL" <<'PYEOF'
+import sys, os, json, datetime
+
+d = sys.argv[1]; maxh = int(sys.argv[2]); req_ext = (sys.argv[3] == "yes")
+UTC = datetime.timezone.utc
+now = datetime.datetime.now(UTC)
+rank = {"OK": 0, "WARN": 1, "FAIL": 2}
+status = "OK"; out = []
+
+def bump(s):
+    global status
+    if rank[s] > rank[status]:
+        status = s
+
+def load(n):
+    try:
+        with open(os.path.join(d, n)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def ts(s):
+    try:
+        return datetime.datetime.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+    except Exception:
+        return None
+
+def hours(t):
+    return int((now - t).total_seconds() // 3600)
+
+def get_list(o, key):
+    try:
+        v = o["data"][key]
+    except Exception:
+        return None
+    if isinstance(v, dict):
+        v = list(v.values())
+    return v if isinstance(v, list) else None
+
+def st(g):
+    try:
+        return int(g.get("status") or 0)
+    except Exception:
+        return 0
+
+def owners(gs):
+    return ", ".join(sorted(set(str(g.get("owner_name", "?")) for g in gs))[:10])
+
+# ---- 1) did the backup runs finish? -----------------------------------------
+groups = get_list(load("groups.json"), "groups")
+if groups is None:
+    out.append("Backup runs : cannot read the queue from the JetBackup API"); bump("WARN")
+else:
+    win = []
+    for g in groups:
+        c = ts(g.get("created"))
+        if c and hours(c) <= maxh:
+            win.append(g)
+    comp = [g for g in win if g.get("ended") and st(g) == 100]
+    part = [g for g in win if g.get("ended") and st(g) == 101]
+    run  = [g for g in win if not g.get("ended")]
+    fail = [g for g in win if g.get("ended") and st(g) not in (100, 101)]
+    out.append("Backup runs : last %dh -> %d total | %d completed | %d partial | %d running | %d failed"
+               % (maxh, len(win), len(comp), len(part), len(run), len(fail)))
+    ends = [ts(g.get("ended")) for g in comp if ts(g.get("ended"))]
+    if ends:
+        out.append("Last finish : %dh ago" % hours(max(ends)))
+    if not win:
+        out.append("Problem     : no JetBackup backup ran in the last %dh" % maxh); bump("FAIL")
+    if fail:
+        out.append("Problem     : %d failed run(s) - accounts: %s" % (len(fail), owners(fail))); bump("FAIL")
+    if part:
+        out.append("Warning     : %d partially completed run(s) - accounts: %s" % (len(part), owners(part))); bump("WARN")
+    if run:
+        out.append("Note        : %d backup(s) still running" % len(run)); bump("WARN")
+
+# ---- 2) is an external destination configured? ------------------------------
+jobs = get_list(load("jobs.json"), "jobs")
+ext = {}   # destination id -> name
+if jobs is None:
+    out.append("Destinations: cannot read backup jobs from the JetBackup API"); bump("WARN")
+else:
+    elig = [j for j in jobs if str(j.get("type", "1")) == "1"] or jobs
+    any_ext = False
+    for j in elig:
+        names = []; job_ext = False
+        for x in (j.get("destination_details") or []):
+            typ = str(x.get("type", "?")); off = bool(x.get("disabled"))
+            local = typ.lower().startswith("local")
+            names.append("%s [%s%s]" % (x.get("name", "?"), typ, ", disabled" if off else ""))
+            if not local and not off:
+                job_ext = True
+                ext[x.get("_id")] = x.get("name", "?")
+        out.append("Job '%s' : %s -> %s" % (j.get("name", "?"), ", ".join(names) or "no destination",
+                                            "external copy configured" if job_ext else "LOCAL ONLY"))
+        if job_ext:
+            any_ext = True
+        elif req_ext:
+            bump("WARN")
+    if not any_ext and req_ext:
+        out.append("Problem     : no backup job has an enabled EXTERNAL destination (no external copy)"); bump("FAIL")
+
+# ---- 3) was the external copy really taken? ---------------------------------
+def walk(o, acc):
+    if isinstance(o, dict):
+        if "created" in o and ("destination" in o or "destination_name" in o):
+            acc.append(o)
+        for v in o.values():
+            walk(v, acc)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v, acc)
+
+snaps = []
+b = load("backups.json")
+if b:
+    walk(b.get("data"), snaps)
+newest = {}
+for s in snaps:
+    c = ts(s.get("created")); dst = s.get("destination")
+    if c and dst and (dst not in newest or c > newest[dst]):
+        newest[dst] = c
+anyfresh = any(hours(c) <= maxh for c in newest.values())
+for did, nm in ext.items():
+    c = newest.get(did)
+    if c and hours(c) <= maxh:
+        out.append("External copy : '%s' newest snapshot %dh ago - OK" % (nm, hours(c)))
+    elif anyfresh:
+        out.append("External copy : '%s' has NO snapshot newer than %dh (local destinations have fresh ones)" % (nm, maxh))
+        bump("FAIL")
+    else:
+        out.append("External copy : '%s' could not be verified (snapshot list empty or unreadable)" % nm)
+        bump("WARN")
+
+print(status)
+print("\n".join(out))
+PYEOF
+)
+  rm -rf "$tmp"
+
+  if [[ -z "$res" ]]; then
+    JB_STATUS="WARN"; JB_DETAILS="Could not read JetBackup output (API call failed or timed out)"
+    return
+  fi
+  JB_STATUS="$(head -n1 <<< "$res")"
+  JB_DETAILS="$(tail -n +2 <<< "$res")"$'\n'
+}
+
+# ------------------------- Check 3: Git backup (external copy) ---------------
+GIT_STATUS="SKIP"; GIT_DETAILS=""
+
+check_git() {
+  GIT_STATUS="OK"; GIT_DETAILS=""
+  local d="" g
+
+  if [[ -z "$GIT_REPO_DIR" || ! -d "${GIT_REPO_DIR}/.git" ]]; then
+    GIT_STATUS="FAIL"
+    GIT_DETAILS="Git repo not found: '${GIT_REPO_DIR}' (set GIT_REPO_DIR to your real repo path, or CHECK_GIT=\"no\")"$'\n'
+    return
+  fi
+
+  g() { git -c safe.directory="$GIT_REPO_DIR" -C "$GIT_REPO_DIR" "$@"; }
+
+  local local_hash remote_hash commit_ts age_h dirty
+  local_hash=$(g rev-parse "refs/heads/${GIT_BRANCH}" 2>/dev/null)
+  if [[ -z "$local_hash" ]]; then
+    GIT_STATUS="FAIL"
+    GIT_DETAILS="Branch '${GIT_BRANCH}' not found in ${GIT_REPO_DIR}"$'\n'
+    return
+  fi
+
+  commit_ts=$(g log -1 --format=%ct "$GIT_BRANCH" 2>/dev/null)
+  age_h=$(( ( $(date +%s) - ${commit_ts:-0} ) / 3600 ))
+  d+="Local commit : ${local_hash:0:8} (${age_h}h ago)"$'\n'
+
+  if [[ "$GIT_CHECK_COMMIT_AGE" == "yes" ]] && (( age_h > GIT_MAX_AGE_HOURS )); then
+    GIT_STATUS="FAIL"
+    d+="Problem      : last commit is older than ${GIT_MAX_AGE_HOURS}h (backup not taken?)"$'\n'
+  fi
+
+  dirty=$(g status --porcelain 2>/dev/null | wc -l)
+  if (( dirty > 0 )); then
+    d+="Warning      : ${dirty} uncommitted change(s) in the repo"$'\n'
+    [[ "$GIT_STATUS" == "OK" ]] && GIT_STATUS="WARN"
+  fi
+
+  remote_hash=$(GIT_TERMINAL_PROMPT=0 timeout 60 git -c safe.directory="$GIT_REPO_DIR" \
+                -C "$GIT_REPO_DIR" ls-remote "$GIT_REMOTE" "refs/heads/${GIT_BRANCH}" 2>/dev/null | awk '{print $1}')
+  if [[ -z "$remote_hash" ]]; then
+    GIT_STATUS="FAIL"
+    d+="Remote       : cannot reach '${GIT_REMOTE}' or branch missing (external copy NOT verified)"$'\n'
+  elif [[ "$remote_hash" == "$local_hash" ]]; then
+    d+="Remote       : ${GIT_REMOTE}/${GIT_BRANCH} = ${remote_hash:0:8} (external copy in sync ✔)"$'\n'
+  else
+    GIT_STATUS="FAIL"
+    d+="Remote       : ${GIT_REMOTE}/${GIT_BRANCH} = ${remote_hash:0:8} (NOT in sync - push failed?)"$'\n'
+  fi
+
+  GIT_DETAILS="$d"
+}
+
+# ------------------------- Check 4: extra backups ----------------------------
+EX_STATUS="SKIP"; EX_DETAILS=""
+
+check_extra() {
+  EX_STATUS="OK"; EX_DETAILS=""
+  local item name path maxh newest age_h d=""
+  for item in "${EXTRA_BACKUPS[@]}"; do
+    IFS='|' read -r name path maxh <<< "$item"
+    maxh="${maxh:-26}"
+    if [[ ! -e "$path" ]]; then
+      d+="${name} : path not found (${path})"$'\n'; EX_STATUS="FAIL"; continue
+    fi
+    newest=$(find "$path" -maxdepth 4 -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -n1 | cut -d. -f1)
+    if [[ -z "$newest" ]]; then
+      d+="${name} : no files in ${path}"$'\n'; EX_STATUS="FAIL"; continue
+    fi
+    age_h=$(( ( $(date +%s) - newest ) / 3600 ))
+    if (( age_h > maxh )); then
+      d+="${name} : newest file is ${age_h}h old (max ${maxh}h) - ${path}"$'\n'; EX_STATUS="FAIL"
+    else
+      d+="${name} : OK, newest file ${age_h}h ago - ${path}"$'\n'
+    fi
+  done
+  EX_DETAILS="$d"
+}
+
+# ------------------------------ Run ------------------------------------------
+log "===== Run started (v${VERSION}) on ${SERVER_NAME} ====="
+
+SEC_TITLE=(); SEC_STATUS=(); SEC_DETAILS=()
+add_section() { SEC_TITLE+=("$1"); SEC_STATUS+=("$2"); SEC_DETAILS+=("$3"); }
+
+if [[ "$CHECK_CPANEL" == "yes" ]]; then
+  check_cpanel; add_section "cPanel internal backup" "$CP_STATUS" "$CP_DETAILS"
+fi
+if [[ "$CHECK_JETBACKUP" != "no" ]]; then
+  check_jetbackup
+  [[ "$JB_STATUS" != "SKIP" ]] && add_section "JetBackup (incl. external copy)" "$JB_STATUS" "$JB_DETAILS"
+fi
+if [[ "$CHECK_GIT" == "yes" ]]; then
+  check_git; add_section "Git backup (external copy)" "$GIT_STATUS" "$GIT_DETAILS"
+fi
+if [[ ${#EXTRA_BACKUPS[@]} -gt 0 ]]; then
+  check_extra; add_section "Extra backups" "$EX_STATUS" "$EX_DETAILS"
+fi
+
+OVERALL="OK"
+for s in "${SEC_STATUS[@]}"; do OVERALL="$(worse "$OVERALL" "$s")"; done
+
+SUBJECT="[${OVERALL}] Backup report - ${SERVER_NAME}"
+REPORT="$(icon "$OVERALL") Backup Report - ${SERVER_NAME}
+Date    : $(date '+%F %T %Z')
+Overall : ${OVERALL}
+"
+for i in "${!SEC_TITLE[@]}"; do
+  REPORT+="
+$(icon "${SEC_STATUS[$i]}") ${SEC_TITLE[$i]} : ${SEC_STATUS[$i]}
+${SEC_DETAILS[$i]}"
+done
+REPORT+="
+-- cPanel Backup Monitor v${VERSION} | ${AUTHOR}"
+
+log "Result: overall=${OVERALL} ($(for i in "${!SEC_TITLE[@]}"; do printf '%s=%s ' "${SEC_TITLE[$i]// /_}" "${SEC_STATUS[$i]}"; done))"
+
+if [[ "$NOTIFY_ON" == "always" || "$OVERALL" != "OK" ]]; then
+  notify_all
+else
+  log "Everything OK and NOTIFY_ON=failure -> no notification sent"
+fi
+
+log "===== Run finished ====="
+printf '%s\n' "$REPORT"
+
+case "$OVERALL" in OK) exit 0;; WARN) exit 1;; *) exit 2;; esac
