@@ -1,0 +1,1123 @@
+#!/bin/bash
+###############################################################################
+# WHM / cPanel Server Setup & Hardening Script
+# Programmed by: Eng. Samir Abo El-Kheir
+# Version: 5.4
+###############################################################################
+
+# Bump this on every change pushed to the repo so any server's log clearly
+# shows which revision of the script actually ran (git log / GitHub tags
+# should carry a matching tag, e.g. v5.0.0).
+SCRIPT_VERSION="5.5.1"
+
+set -uo pipefail
+LOG="/root/whm_setup_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "=================================================================="
+echo " WHM Setup Script v${SCRIPT_VERSION} - by Eng. Samir Abo El-Kheir"
+echo " Started $(date)"
+echo " Log file: $LOG"
+if command -v git >/dev/null 2>&1 && git -C "$SELF_DIR" rev-parse --short HEAD >/dev/null 2>&1; then
+    echo " Git commit: $(git -C "$SELF_DIR" rev-parse --short HEAD) (branch: $(git -C "$SELF_DIR" rev-parse --abbrev-ref HEAD))"
+fi
+echo "=================================================================="
+
+# ---------------------------------------------------------------------------
+# 0) Sanity checks
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[ERROR] Must be run as root." >&2
+    exit 1
+fi
+
+if [ ! -x /usr/local/cpanel/cpanel ] && ! command -v whmapi1 >/dev/null 2>&1; then
+    echo "[ERROR] This does not look like a cPanel/WHM server (whmapi1 not found)." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 1) Disable WHM Terminal
+# ---------------------------------------------------------------------------
+echo
+echo "== [1/16] Disabling WHM Terminal =="
+touch /var/cpanel/disable_whm_terminal_ui
+echo "Done: /var/cpanel/disable_whm_terminal_ui created, WHM Terminal (root/reseller"
+echo "admin-level, WHM >> Server Configuration >> Terminal) stays disabled."
+
+# ---------------------------------------------------------------------------
+# 1b) Enable cPanel's OWN Terminal (cPanel >> Advanced >> Terminal) for
+#     cPanel users - this is a DIFFERENT feature/toggle than WHM Terminal
+#     above. It needs two things: the "Terminal" feature turned on in every
+#     feature list, AND shell access enabled on each account.
+# ---------------------------------------------------------------------------
+echo
+echo "== [1b/16] Enabling cPanel's own Terminal (cPanel >> Advanced >> Terminal) =="
+echo "[WARN] This gives EVERY cPanel account (not just root) command-line"
+echo "[WARN] access to the server under their own user. Combined with a"
+echo "[WARN] Normal (non-jailed) shell this is a significant privilege"
+echo "[WARN] increase for every hosting customer on this box - make sure"
+echo "[WARN] that is actually what you want before continuing."
+
+# 1) Turn the "Terminal" feature ON in every existing feature list, so it's
+#    not hidden from users whose feature list excludes it.
+if [ -d /var/cpanel/featurelists ]; then
+    for fl in /var/cpanel/featurelists/*.conf; do
+        [ -f "$fl" ] || continue
+        cp -a "$fl" "${fl}.bak_$(date +%Y%m%d%H%M%S)"
+        if grep -q '^terminal=' "$fl"; then
+            sed -i 's/^terminal=.*/terminal=1/' "$fl"
+        else
+            echo "terminal=1" >> "$fl"
+        fi
+    done
+    echo "Terminal feature enabled in all existing feature lists under /var/cpanel/featurelists/."
+else
+    echo "[WARN] /var/cpanel/featurelists not found, skipping feature-list edit."
+fi
+
+# 2) Grant shell access to every existing cPanel account so the Terminal
+#    app actually has a shell to open. Defaults to jailed shell via WHM's
+#    own default unless the account already specifies otherwise.
+if [ -d /var/cpanel/users ]; then
+    for userfile in /var/cpanel/users/*; do
+        acct=$(basename "$userfile")
+        # Skip WHM's own internal/reserved entries if any slip in here.
+        [ "$acct" = "root" ] && continue
+        echo "--- Enabling shell access for account: $acct ---"
+        whmapi1 modifyacct user="$acct" HASSHELL=1 2>&1 | tail -n 5
+    done
+else
+    echo "[WARN] /var/cpanel/users not found, skipping per-account shell access."
+fi
+
+echo "cPanel Terminal should now be visible under cPanel >> Advanced >> Terminal"
+echo "for accounts with shell access enabled."
+echo "NOTE: newly-created accounts get their shell-access setting from the"
+echo "      hosting package they're created with, not from this one-time run -"
+echo "      set 'Shell Access' in WHM >> Packages if you want it on by default"
+echo "      for future accounts too."
+
+# ---------------------------------------------------------------------------
+# 2) Enable Backups: Daily / Weekly / Monthly, 1 copy each
+# ---------------------------------------------------------------------------
+echo
+echo "== [2/16] Configuring cPanel Backups =="
+whmapi1 backup_config_set \
+    backupenable=1 \
+    backuptype=compressed \
+    backupfiles=1 \
+    backupmysql=1 \
+    backupaccts=1 \
+    backup_daily_enable=1 \
+    backup_daily_retention=1 \
+    backupdays="1,2,3,4,5,6,0" \
+    backup_weekly_enable=1 \
+    backup_weekly_day=6 \
+    backup_weekly_retention=1 \
+    backup_monthly_enable=1 \
+    backup_monthly_dates=1 \
+    backup_monthly_retention=1
+
+echo "Backups configured: Daily/Weekly/Monthly enabled, retention = 1 copy each."
+echo "NOTE: verify the backup destination/directory from WHM >> Backup Configuration"
+echo "      (BACKUPDIR) - this script does not change the storage destination."
+
+# ---------------------------------------------------------------------------
+# 3) Install & enable CSF (ConfigServer Security & Firewall)
+# ---------------------------------------------------------------------------
+echo
+echo "== [3/16] Installing CSF =="
+if [ -d /etc/csf ]; then
+    echo "CSF already installed, skipping install, will just re-enable it."
+else
+    cd /usr/src || exit 1
+    rm -rf csf csf.tgz
+
+    CSF_URLS=(
+        "https://download.configserver.com/csf.tgz"
+        "https://download.configserver.dev/csf.tgz"
+        "http://download.configserver.com/csf.tgz"
+    )
+
+    for url in "${CSF_URLS[@]}"; do
+        echo "Trying to download CSF from: $url"
+        wget -q --timeout=20 --tries=2 "$url" -O csf.tgz
+        if [ -s csf.tgz ]; then
+            echo "Downloaded CSF successfully from $url"
+            break
+        fi
+        rm -f csf.tgz
+    done
+
+    if [ ! -s csf.tgz ]; then
+        echo "[ERROR] Failed to download csf.tgz from all mirrors." >&2
+        echo "[ERROR] Check outbound network/firewall (port 80/443 egress) and DNS resolution." >&2
+        echo "[ERROR] You can install CSF manually later with:" >&2
+        echo "        cd /usr/src && wget https://download.configserver.com/csf.tgz && tar -xzf csf.tgz && cd csf && sh install.sh" >&2
+    else
+        tar -xzf csf.tgz
+        cd csf || exit 1
+        sh install.sh
+    fi
+fi
+
+if [ -f /etc/csf/csf.conf ]; then
+    sed -i 's/^TESTING = "1"/TESTING = "0"/' /etc/csf/csf.conf
+    systemctl enable csf lfd 2>/dev/null
+    systemctl restart lfd 2>/dev/null
+    csf -r
+    echo "CSF installed, TESTING mode disabled, csf/lfd enabled and restarted."
+else
+    echo "[WARN] CSF config not found at /etc/csf/csf.conf - install did not complete."
+    echo "[WARN] Re-run step 3 manually once network access to configserver.com is confirmed."
+fi
+
+# ---------------------------------------------------------------------------
+# 4) Install every available PHP version (EasyApache4) + common extensions
+# ---------------------------------------------------------------------------
+echo
+echo "== [4/16] Installing all EasyApache4 PHP versions =="
+
+# cPanel/EA4 needs an up-to-date version and a fresh repo cache before newer
+# PHP builds (8.4, 8.5) show up at all. ea-php84 has been in EA4 since Dec
+# 2024 and ea-php85 (GA) since EA4 v25.37 - if they're missing below, this is
+# almost always a stale cPanel/EA4 build or stale yum cache, not this script.
+echo "--- Updating cPanel & WHM and refreshing EA4/yum repo metadata first ---"
+/scripts/upcp --now 2>&1 | tail -n 30
+yum clean all 2>/dev/null
+yum makecache 2>/dev/null
+/usr/local/cpanel/scripts/build_local_repo_conf 2>/dev/null
+
+# NOTE: the EA4 repo id is NOT always "EA4" (e.g. "EA4-c8" on AlmaLinux/CloudLinux 8),
+# so versions are detected from `yum list` (repo-id independent). Both "available"
+# and "installed" are listed so versions already on the box are still processed.
+PHP_VERSIONS=$( { yum list available 'ea-php*' 2>/dev/null; yum list installed 'ea-php*' 2>/dev/null; } \
+    | grep -Eoh "^ea-php[0-9]{2,3}\." | sed 's/\.$//' | sort -u)
+
+echo "PHP versions found in EA4 repo after refresh: $PHP_VERSIONS"
+
+# Explicitly force-attempt php84/php85 install and report exactly why they
+# succeeded/failed, instead of only relying on the detected list.
+for wanted in ea-php84 ea-php85; do
+    echo "--- Explicitly attempting to install ${wanted} ---"
+    if yum install -y "${wanted}" "${wanted}-meta" 2>&1 | tail -n 15; then
+        :
+    fi
+    if rpm -q "${wanted}" >/dev/null 2>&1; then
+        echo "  -> ${wanted}: INSTALLED successfully."
+        PHP_VERSIONS=$(printf '%s\n%s\n' "$PHP_VERSIONS" "$wanted" | sort -u)
+    else
+        echo "  -> ${wanted}: NOT installed."
+        echo "     Most common causes on cPanel:"
+        echo "       1. cPanel & WHM build is older than the release that added"
+        echo "          this PHP version - check WHM >> cPanel Update Preferences"
+        echo "          and run: /scripts/upcp --now"
+        echo "       2. EA4/yum repo cache is stale - this script already ran"
+        echo "          'yum clean all && yum makecache', but a full"
+        echo "          '/scripts/easyapache4 --unlock' + retry may be needed."
+        echo "       3. Your license/profile restricts available packages -"
+        echo "          check WHM >> EasyApache 4 >> PHP tab directly to confirm"
+        echo "          whether ${wanted} appears as installable there."
+    fi
+done
+
+# Extensions installed for every PHP version found above.
+EXT_LIST="php-cli php-common php-mysqlnd php-mbstring php-xml php-curl php-gd php-zip php-opcache php-intl php-soap php-bcmath php-imap php-fileinfo php-sockets php-pdo php-gmp php-calendar php-pgsql php-memcached php-snmp php-dba php-iconv php-pspell php-process php-ldap php-bz2 php-gettext php-tidy php-exif php-enchant php-dbg php-odbc php-xmlrpc php-sodium php-fpm php-phalcon"
+
+for ver in $PHP_VERSIONS; do
+    echo "--- Installing $ver + extensions ---"
+    pkgs="$ver"
+    for ext in $EXT_LIST; do
+        pkgs="$pkgs ${ver}-${ext}"
+    done
+    # Not every extension exists for every PHP version. dnf aborts the WHOLE
+    # transaction on a single missing package unless strict=0, so unavailable
+    # packages are skipped instead of failing the entire batch.
+    yum install -y --setopt=strict=0 $pkgs
+done
+
+/usr/local/cpanel/scripts/build_local_repo_conf 2>/dev/null
+whmapi1 php_get_installable_versions >/dev/null 2>&1
+
+echo "PHP installation step complete."
+
+# ---------------------------------------------------------------------------
+# 4b) Install Imagick and Redis extensions via PECL for every PHP version
+#     (these are not shipped as ea-phpXX-php-imagick / -redis packages in the
+#     base EA4 repo, so PECL is the standard/supported install path)
+# ---------------------------------------------------------------------------
+echo
+echo "== [4b/16] Installing Imagick + Redis PECL extensions for every PHP version =="
+
+# ImageMagick dev headers are required to compile the imagick PECL module.
+yum install -y ImageMagick ImageMagick-devel gcc make 2>/dev/null
+
+for ver in $PHP_VERSIONS; do
+    PECL_BIN="/opt/cpanel/${ver}/root/usr/bin/pecl"
+    PHP_BIN="/opt/cpanel/${ver}/root/usr/bin/php"
+    INI_DIR="/opt/cpanel/${ver}/root/etc/php.d"
+
+    if [ ! -x "$PECL_BIN" ]; then
+        echo "[WARN] $PECL_BIN not found, skipping imagick/redis for $ver."
+        continue
+    fi
+
+    mkdir -p "$INI_DIR"
+    echo "--- $ver: installing imagick via pecl ---"
+    yes '' | "$PECL_BIN" install imagick 2>&1 | tail -n 20
+    if [ -f "${INI_DIR}/imagick.ini" ]; then
+        :
+    else
+        echo "extension=imagick.so" > "${INI_DIR}/zz-imagick.ini"
+    fi
+
+    echo "--- $ver: installing redis via pecl ---"
+    yes '' | "$PECL_BIN" install redis 2>&1 | tail -n 20
+    if [ -f "${INI_DIR}/redis.ini" ]; then
+        :
+    else
+        echo "extension=redis.so" > "${INI_DIR}/zz-redis.ini"
+    fi
+
+    "$PHP_BIN" -m 2>/dev/null | grep -qi imagick && echo "    imagick: OK for $ver" || echo "    [WARN] imagick did not load for $ver, check pecl output above."
+    "$PHP_BIN" -m 2>/dev/null | grep -qi redis && echo "    redis:   OK for $ver" || echo "    [WARN] redis did not load for $ver, check pecl output above."
+done
+
+echo "NOTE: ionCube Loader, SourceGuardian and memcached-debugsource are"
+echo "      installed for every PHP version in step 4d below (EA4 packages)."
+
+# ---------------------------------------------------------------------------
+# 4c) Install Node.js (via EA4 ea-nodejsXX package) + npm + common global
+#     npm tooling. NOTE: unlike PHP, EA4's ea-nodejsXX packages CANNOT
+#     coexist - each one provides/owns the same "ea4-nodejs" system path and
+#     they hard-conflict with each other in yum/dnf. Only ONE version can be
+#     installed system-wide at a time, so we install just the newest one
+#     found, using --allowerasing to replace any older ea-nodejsXX already
+#     on the box instead of looping over every version like the PHP step.
+# ---------------------------------------------------------------------------
+echo
+echo "== [4c/16] Installing Node.js + npm (EasyApache4 ea-nodejs package) =="
+
+NODE_PKGS=$( { yum list available 'ea-nodejs*' 2>/dev/null; yum list installed 'ea-nodejs*' 2>/dev/null; } \
+    | grep -Eoh "^ea-nodejs[0-9]+\." | sed 's/\.$//' | sort -u)
+
+echo "Node.js runtimes found in EA4 repo: $NODE_PKGS"
+
+# Pick the highest-numbered ea-nodejsXX (e.g. ea-nodejs22 over ea-nodejs10).
+NEWEST_NODE_PKG=$(echo "$NODE_PKGS" | sed -E 's/^ea-nodejs([0-9]+)$/\1 &/' | sort -n | awk '{print $2}' | tail -1)
+
+if [ -z "$NEWEST_NODE_PKG" ]; then
+    echo "[WARN] No ea-nodejsXX packages found in the EA4 repo - Node.js Selector"
+    echo "[WARN] runtimes need to come from EasyApache4, same caveat as PHP above"
+    echo "[WARN] (stale cPanel/EA4 build/cache). Falling back to installing"
+    echo "[WARN] system Node.js via NodeSource so 'node'/'npm' are at least"
+    echo "[WARN] available on the shell."
+    curl -fsSL https://rpm.nodesource.com/setup_lts.x 2>/dev/null | bash - 2>/dev/null
+    yum install -y nodejs 2>/dev/null
+else
+    echo "--- Installing ${NEWEST_NODE_PKG} (newest EA4 Node.js runtime found) ---"
+    echo "    (any older ea-nodejsXX already installed will be replaced - they"
+    echo "     cannot be installed side-by-side, --allowerasing handles that)"
+    yum install -y --allowerasing "$NEWEST_NODE_PKG" 2>&1 | tail -n 20
+fi
+
+# Make the installed EA4 Node.js runtime available as 'node'/'npm' on the
+# shell PATH.
+if [ -n "$NEWEST_NODE_PKG" ] && [ -x "/opt/cpanel/${NEWEST_NODE_PKG}/bin/node" ]; then
+    ln -sf "/opt/cpanel/${NEWEST_NODE_PKG}/bin/node" /usr/local/bin/node
+    ln -sf "/opt/cpanel/${NEWEST_NODE_PKG}/bin/npm" /usr/local/bin/npm
+    ln -sf "/opt/cpanel/${NEWEST_NODE_PKG}/bin/npx" /usr/local/bin/npx
+    echo "Linked node/npm/npx (${NEWEST_NODE_PKG}) into /usr/local/bin."
+fi
+
+if command -v node >/dev/null 2>&1; then
+    echo "node version: $(node -v 2>/dev/null)"
+fi
+if command -v npm >/dev/null 2>&1; then
+    echo "npm version:  $(npm -v 2>/dev/null)"
+    echo "--- Installing common global npm tooling (pm2, yarn) ---"
+    npm install -g pm2 yarn 2>&1 | tail -n 15
+else
+    echo "[WARN] npm not found on PATH after install - Node.js install likely failed above."
+fi
+
+echo "NOTE: cPanel's 'Setup Node.js App' (Application Manager) manages its own"
+echo "      per-application Node.js virtual environments independently of the"
+echo "      single system-wide ${NEWEST_NODE_PKG:-Node.js} runtime installed here."
+
+# ---------------------------------------------------------------------------
+# 4d) ionCube Loader + SourceGuardian + memcached-debugsource for EVERY PHP
+#     version.
+#     - ionCube: EA4 ships it as ea-phpXX-php-ioncubeNN (NN = loader version,
+#       10..15 etc., depending on what each PHP version supports). Different
+#       ionCube versions of the SAME PHP conflict with each other (PHP can load
+#       only one ionCube loader), so for each PHP version the NEWEST available
+#       ionCube package is installed (tries 15,14,13,12,11,10 and anything else
+#       the repo lists), falling back to older ones if a newer one is missing.
+#     - SourceGuardian: ea-phpXX-php-sourceguardian (where EA4 offers it).
+#     - memcached-debugsource: ea-phpXX-php-memcached-debugsource (debug-symbol
+#       source package, installed only where the enabled repos provide it).
+# ---------------------------------------------------------------------------
+echo
+echo "== [4d/16] Installing ionCube / SourceGuardian / memcached-debugsource on every PHP version =="
+
+for ver in $PHP_VERSIONS; do
+    echo "--- $ver ---"
+    PHP_BIN="/opt/cpanel/${ver}/root/usr/bin/php"
+
+    # ionCube candidates: whatever the repo lists + ioncube15..10, newest first
+    ION_CANDIDATES=$( {
+        yum list available "${ver}-php-ioncube*" 2>/dev/null
+        yum list installed "${ver}-php-ioncube*" 2>/dev/null
+        for n in 15 14 13 12 11 10; do echo "${ver}-php-ioncube${n}.x"; done
+    } | grep -Eoh "^${ver}-php-ioncube[0-9]+" | sort -u \
+      | sed -E "s/^${ver}-php-ioncube([0-9]+)$/\1 &/" | sort -rn | awk '{print $2}')
+
+    ION_DONE=""
+    for pkg in $ION_CANDIDATES; do
+        if rpm -q "$pkg" >/dev/null 2>&1; then
+            ION_DONE="$pkg"; echo "  ionCube: $pkg already installed."; break
+        fi
+        # --allowerasing replaces an older installed ionCube of the same PHP
+        yum install -y --allowerasing "$pkg" >/dev/null 2>&1
+        if rpm -q "$pkg" >/dev/null 2>&1; then
+            ION_DONE="$pkg"; echo "  ionCube: installed $pkg"; break
+        fi
+    done
+    if [ -z "$ION_DONE" ]; then
+        echo "  ionCube: no ionCube package available for $ver in the enabled repos (skipped)."
+    fi
+
+    for extpkg in "${ver}-php-sourceguardian" "${ver}-php-memcached-debugsource"; do
+        if rpm -q "$extpkg" >/dev/null 2>&1; then
+            echo "  ${extpkg}: already installed."
+        else
+            yum install -y --setopt=strict=0 "$extpkg" >/dev/null 2>&1
+            if rpm -q "$extpkg" >/dev/null 2>&1; then
+                echo "  ${extpkg}: installed."
+            else
+                echo "  ${extpkg}: not available for $ver in the enabled repos (skipped)."
+            fi
+        fi
+    done
+
+    if [ -x "$PHP_BIN" ]; then
+        PHP_OUT=$( { "$PHP_BIN" -v; "$PHP_BIN" -m; } 2>&1)
+        echo "$PHP_OUT" | grep -qi ioncube \
+            && echo "  ionCube Loader: LOADED in $ver" \
+            || echo "  [WARN] ionCube Loader not detected in $ver (php -v/-m)."
+        echo "$PHP_OUT" | grep -qi sourceguardian \
+            && echo "  SourceGuardian: LOADED in $ver" \
+            || echo "  [INFO] SourceGuardian not detected in $ver (php -m)."
+    fi
+done
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# 5) Disable dangerous PHP functions in EVERY installed PHP version
+# ---------------------------------------------------------------------------
+echo
+echo "== [5/16] Disabling risky PHP functions in all installed versions =="
+
+DISABLE_FUNCS="dl,exec,system,shell_exec,passthru,popen,proc_open,proc_close,proc_terminate,proc_nice,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,escapeshellcmd,escapeshellarg,posix_kill,posix_setuid,posix_setgid,posix_setsid,posix_setpgid,posix_mknod,posix_seteuid,posix_setegid,apache_child_terminate,apache_setenv,apache_note,ini_restore,define_syslog_variables,openlog,syslog,closelog,leak,listen,virtual,show_source"
+
+for ini in /opt/cpanel/ea-php*/root/etc/php.ini; do
+    [ -f "$ini" ] || continue
+    echo "--- Updating $ini ---"
+    cp -a "$ini" "${ini}.bak_$(date +%Y%m%d%H%M%S)"
+    if grep -q '^disable_functions' "$ini"; then
+        sed -i "s/^disable_functions.*/disable_functions = ${DISABLE_FUNCS}/" "$ini"
+    else
+        echo "disable_functions = ${DISABLE_FUNCS}" >> "$ini"
+    fi
+done
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+echo "disable_functions applied to all php.ini files found under /opt/cpanel/."
+
+# ---------------------------------------------------------------------------
+# 5b) Apply custom PHP resource-limit directives to EVERY installed PHP
+#     version's php.ini (values as explicitly requested - NOTE these are
+#     extremely high compared to PHP defaults, see warnings below).
+# ---------------------------------------------------------------------------
+echo
+echo "== [5b/16] Applying custom PHP ini limits to all installed PHP versions =="
+echo "[WARN] memory_limit=12800000M and max_execution_time=3000000s are far"
+echo "[WARN] above normal production values. A single runaway script can now"
+echo "[WARN] consume effectively unlimited RAM and run for over a month"
+echo "[WARN] without being killed. Proceeding because this was explicitly"
+echo "[WARN] confirmed, but monitor server load/memory closely after this."
+
+set_php_directive() {
+    local ini="$1" key="$2" value="$3"
+    if grep -qE "^[; ]*${key}[[:space:]]*=" "$ini"; then
+        sed -i -E "s|^[; ]*${key}[[:space:]]*=.*|${key} = ${value}|" "$ini"
+    else
+        echo "${key} = ${value}" >> "$ini"
+    fi
+}
+
+for ini in /opt/cpanel/ea-php*/root/etc/php.ini; do
+    [ -f "$ini" ] || continue
+    echo "--- Updating PHP limits in $ini ---"
+    cp -a "$ini" "${ini}.bak_$(date +%Y%m%d%H%M%S)"
+
+    set_php_directive "$ini" "max_execution_time" "3000000"
+    set_php_directive "$ini" "max_input_time" "6000000"
+    set_php_directive "$ini" "max_input_vars" "100000"
+    set_php_directive "$ini" "memory_limit" "12800000M"
+    set_php_directive "$ini" "post_max_size" "800M"
+    set_php_directive "$ini" "upload_max_filesize" "200M"
+done
+
+# Also push the same values through WHM's MultiPHP INI Editor API so they
+# show up correctly in WHM's UI (per PHP version) and aren't just raw
+# php.ini edits that WHM might later overwrite.
+for ver in $PHP_VERSIONS; do
+    whmapi1 php_ini_set_directives \
+        version="$ver" \
+        max_execution_time=3000000 \
+        max_input_time=6000000 \
+        max_input_vars=100000 \
+        memory_limit=12800000M \
+        post_max_size=800M \
+        upload_max_filesize=200M \
+        2>/dev/null
+done
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+echo "Custom PHP limits applied to all php.ini files and via WHM MultiPHP INI Editor."
+
+# ---------------------------------------------------------------------------
+# 6) Run /scripts/securetmp
+# ---------------------------------------------------------------------------
+echo
+echo "== [6/16] Running /scripts/securetmp =="
+if [ -x /scripts/securetmp ]; then
+    /scripts/securetmp --auto
+else
+    echo "[WARN] /scripts/securetmp not found or not executable."
+fi
+
+# ---------------------------------------------------------------------------
+# 7) Enable cPHulk Brute Force Protection
+# ---------------------------------------------------------------------------
+echo
+echo "== [7/16] Enabling cPHulk Brute Force Protection =="
+whmapi1 enable_cphulk
+whmapi1 save_cphulk_config \
+    ip_based_protection=1 \
+    block_brute_force_with_firewall=1 \
+    block_excessive_brute_force_with_firewall=1 \
+    ip_brute_force_period_mins=15 \
+    lookback_period_min=360 \
+    mark_as_brute=30
+
+echo "cPHulk enabled with firewall-based blocking for brute force attempts."
+echo "IMPORTANT: whitelist your own admin IP(s) in WHM >> cPHulk Brute Force Protection >> Whitelist Management"
+echo "           to avoid locking yourself out."
+
+# ---------------------------------------------------------------------------
+# 8) Install & enable ModSecurity + OWASP Core Rule Set
+# ---------------------------------------------------------------------------
+echo
+echo "== [8/16] Installing ModSecurity + OWASP CRS =="
+
+if ! rpm -qa | grep -q ea-apache24-mod_security2; then
+    yum install -y ea-apache24-mod_security2
+fi
+
+yum install -y ea-modsec2-rules-owasp-crs
+
+if [ -f /etc/apache2/conf.d/modsec2.conf ]; then
+    sed -i 's/^SecRuleEngine.*/SecRuleEngine On/' /etc/apache2/conf.d/modsec2.conf 2>/dev/null
+fi
+
+whmapi1 modsec_configure enabled=1 2>/dev/null
+
+/usr/local/cpanel/scripts/restartsrv_apache_php_fpm 2>/dev/null
+/usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+
+echo "ModSecurity + OWASP CRS installed and enabled (SecRuleEngine On)."
+echo "NOTE: OWASP CRS can occasionally flag legitimate traffic (false positives)."
+echo "      Monitor WHM >> Security Center >> ModSecurity Tools for the first few days"
+echo "      and add per-site exceptions there if a real site gets blocked."
+
+# ---------------------------------------------------------------------------
+# 8b) Apache Include Editor -> Post VirtualHost Include -> All Versions
+#     (WHM >> Service Configuration >> Apache Configuration >> Include Editor)
+#     This is the file /etc/apache2/conf.d/includes/post_virtualhost_global.conf
+#     The block between the BEGIN/END markers is owned by this script, so it
+#     is replaced (not duplicated) on every re-run; anything else already in
+#     the file is left untouched.
+# ---------------------------------------------------------------------------
+echo
+echo "== [8b/16] Apache Include Editor: Post VirtualHost Include (All Versions) =="
+
+INC_DIR=/etc/apache2/conf.d/includes
+INC_FILE="$INC_DIR/post_virtualhost_global.conf"
+HTTPD_BIN="$(command -v httpd || echo /usr/sbin/httpd)"
+mkdir -p "$INC_DIR"
+touch "$INC_FILE"
+INC_BAK="${INC_FILE}.bak_$(date +%Y%m%d%H%M%S)"
+cp -a "$INC_FILE" "$INC_BAK"
+
+sed -i '/# BEGIN whm_setup security/,/# END whm_setup security/d' "$INC_FILE"
+cat >> "$INC_FILE" <<'APACHE_EOF'
+# BEGIN whm_setup security
+<LocationMatch "^/cgi-sys/defaultwebpage\.cgi$">
+    Require all denied
+    ErrorDocument 403 "Access not allowed "
+</LocationMatch>
+# END whm_setup security
+APACHE_EOF
+
+# Regenerate httpd.conf so the include is wired in, then validate before restarting
+/usr/local/cpanel/scripts/rebuildhttpdconf 2>&1 | tail -n 5
+
+if ! grep -q "post_virtualhost_global.conf" /etc/apache2/conf/httpd.conf 2>/dev/null; then
+    echo "[WARN] httpd.conf does not reference post_virtualhost_global.conf yet."
+    echo "[WARN] Fallback: WHM >> Apache Configuration >> Include Editor >>"
+    echo "[WARN] Post VirtualHost Include >> All Versions, paste the block and Save."
+fi
+
+if "$HTTPD_BIN" -t >/dev/null 2>&1; then
+    /usr/local/cpanel/scripts/restartsrv_httpd 2>/dev/null
+    echo "Apache config OK - defaultwebpage.cgi block added to $INC_FILE, Apache restarted."
+else
+    echo "[ERROR] Apache config test FAILED with the new include - restoring previous file." >&2
+    "$HTTPD_BIN" -t 2>&1 | tail -n 5
+    cp -a "$INC_BAK" "$INC_FILE"
+    /usr/local/cpanel/scripts/rebuildhttpdconf >/dev/null 2>&1
+fi
+
+# ---------------------------------------------------------------------------
+# 8c) Additional hardening
+#     a) CSF SMTP_BLOCK      - only Exim/root may open outgoing SMTP connections
+#     b) Mail limits         - max 100 emails/hour per domain + track origin
+#     c) Pure-FTPd           - require TLS, no anonymous logins
+#     d) WHM Tweak Settings  - referrer checks, cookie IP validation, no proxy subdomains
+#     e) sysctl              - SYN cookies, rp_filter, no ICMP redirects
+#     (PHP open_basedir is intentionally NOT done here: the WHM "PHP open_basedir
+#      Tweak" no longer exists in EasyApache 4 and a blanket value would break sites.)
+# ---------------------------------------------------------------------------
+echo
+echo "== [8c/16] Additional hardening (SMTP block, mail limits, FTP TLS, Tweak Settings, sysctl) =="
+
+# Helper: set a WHM Tweak Setting and report whether WHM accepted it
+set_tweak() {
+    local key="$1" value="$2" out
+    out=$(whmapi1 set_tweaksetting key="$key" value="$value" 2>&1)
+    if echo "$out" | grep -qE '^[[:space:]]+result: 1'; then
+        echo "  Tweak Setting ${key} = ${value} : OK"
+    else
+        echo "  [WARN] Could not set Tweak Setting ${key}=${value} (key name may differ on this cPanel version):"
+        echo "$out" | grep -iE 'reason|statusmsg' | head -n 2
+    fi
+}
+
+# --- a) CSF SMTP_BLOCK ------------------------------------------------------
+echo "--- a) CSF SMTP_BLOCK ---"
+echo "[WARN] After this, ONLY root, Exim and mail/mailman can open outgoing SMTP"
+echo "[WARN] connections (ports 25/465/587). Customer scripts/plugins that send"
+echo "[WARN] through an EXTERNAL SMTP server (Gmail, SendGrid, ...) will be rejected"
+echo "[WARN] and must use the server's own mail (localhost) instead."
+if [ -f /etc/csf/csf.conf ]; then
+    if grep -qE '^SMTP_BLOCK[[:space:]]*=' /etc/csf/csf.conf; then
+        sed -i -E 's/^SMTP_BLOCK[[:space:]]*=.*/SMTP_BLOCK = "1"/' /etc/csf/csf.conf
+    else
+        echo 'SMTP_BLOCK = "1"' >> /etc/csf/csf.conf
+    fi
+    csf -r >/dev/null 2>&1
+    grep -E '^SMTP_BLOCK' /etc/csf/csf.conf
+    echo "NOTE: WHM >> Security Center >> SMTP Restrictions is NOT enabled on purpose -"
+    echo "      with CSF installed, cPanel recommends SMTP_BLOCK instead of both."
+else
+    echo "[WARN] CSF is not installed - SMTP_BLOCK skipped."
+fi
+
+# --- b) Mail limits ---------------------------------------------------------
+echo "--- b) Mail limits (WHM Tweak Settings >> Mail) ---"
+set_tweak maxemailsperhour 100
+set_tweak trackmailuserorigin 1
+echo "NOTE: limit is 100 emails/hour per domain - newsletters/mailing lists above that"
+echo "      will be blocked/deferred. Per-account overrides: WHM >> Packages / Modify Account."
+
+# --- c) Pure-FTPd: require TLS, no anonymous ---------------------------------
+echo "--- c) Pure-FTPd hardening ---"
+FTP_SERVER=$(grep -E '^ftpserver=' /var/cpanel/cpanel.config 2>/dev/null | cut -d= -f2)
+if [ "$FTP_SERVER" = "pure-ftpd" ]; then
+    mkdir -p /var/cpanel/conf/pureftpd
+    FTP_LOCAL=/var/cpanel/conf/pureftpd/local
+    touch "$FTP_LOCAL"
+    cp -a "$FTP_LOCAL" "${FTP_LOCAL}.bak_$(date +%Y%m%d%H%M%S)"
+    for kv in "TLS 2" "NoAnonymous yes"; do
+        key="${kv%% *}"
+        sed -i "/^${key}[[:space:]]/d" "$FTP_LOCAL"
+        echo "$kv" >> "$FTP_LOCAL"
+    done
+    /scripts/setupftpserver pure-ftpd --force 2>&1 | tail -n 5
+    echo "Resulting FTP settings (check TLS=2 and NoAnonymous=yes):"
+    grep -hE '^(TLS|NoAnonymous)' /etc/pure-ftpd.conf /etc/pureftpd.conf 2>/dev/null
+    echo "NOTE: TLS 2 refuses plain (non-TLS) FTP, so old FTP clients without TLS can no"
+    echo "      longer connect. SFTP (SSH) is not affected."
+else
+    echo "FTP server is '${FTP_SERVER:-unknown}' (not pure-ftpd) - FTP hardening skipped."
+fi
+
+# --- d) WHM Tweak Settings --------------------------------------------------
+echo "--- d) WHM Tweak Settings (Security) ---"
+set_tweak referrersafety 1
+set_tweak referrerblanksafety 1
+set_tweak cookieipvalidation strict
+set_tweak proxysubdomains 0
+echo "NOTE: proxysubdomains=0 turns off cpanel./webmail./whm.<domain> addresses -"
+echo "      users must use <domain>:2083 / :2096 or the server hostname instead."
+echo "NOTE: blank-referrer safety can break bookmarks/direct links into cPanel/WHM"
+echo "      pages - users must log in through the normal login page first."
+
+# --- e) sysctl network hardening --------------------------------------------
+echo "--- e) sysctl network hardening ---"
+cat > /etc/sysctl.d/99-whm-hardening.conf <<'SYSCTL_EOF'
+# Written by whm_setup
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+SYSCTL_EOF
+sysctl --system >/dev/null 2>&1
+sysctl net.ipv4.tcp_syncookies net.ipv4.conf.all.rp_filter net.ipv4.conf.all.accept_redirects net.ipv4.conf.all.send_redirects 2>/dev/null
+echo "NOTE: strict rp_filter can drop traffic on servers with asymmetric routing /"
+echo "      several uplinks - fine on a normal single-uplink server."
+
+# --- f) Shell Fork Bomb Protection (WHM >> Security Center) -------------------
+echo "--- f) Shell Fork Bomb Protection ---"
+FORKBOMB_BIN=/usr/local/cpanel/bin/install-login-profile
+if [ -x "$FORKBOMB_BIN" ]; then
+    "$FORKBOMB_BIN" --install limits 2>&1 | tail -n 5
+    echo "Fork Bomb Protection install command finished (exit code: ${PIPESTATUS[0]})."
+    echo "Verify in WHM >> Security Center >> Shell Fork Bomb Protection (should show Enabled)."
+    echo "NOTE: per cPanel docs it applies a ulimit to cPanel users with bash shell access:"
+    echo "      max 35 processes per user, 100 open files, 200000 KB core/data/RSS."
+    echo "      Heavy shell jobs (composer, npm build, large git/tar jobs) may hit these limits."
+    echo "      It only takes effect for NEW login sessions."
+else
+    echo "[WARN] $FORKBOMB_BIN not found - enable it manually in WHM >> Security Center >>"
+    echo "[WARN] Shell Fork Bomb Protection."
+fi
+
+# ---------------------------------------------------------------------------
+# 9) Root SSH key setup
+# ---------------------------------------------------------------------------
+echo
+echo "== [9/16] Setting up root SSH key access =="
+
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+if [ ! -f /root/.ssh/id_rsa ]; then
+    ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N "" -C "root@$(hostname)"
+    echo "New local keypair generated: /root/.ssh/id_rsa / id_rsa.pub"
+else
+    echo "Local keypair already exists at /root/.ssh/id_rsa, skipping generation."
+fi
+
+PUBKEY='ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAsJAbH514tlSeiPoe84iSxfWCS1VQ2uEFC6h84pXt1Xne9V6d5TJ+1i35w8djPy+fiuSvgEx8DOtbK6+sQD2MXAXH9MUmj7ePT5XUgPRHgzoSpducxbn1prnxiNtj+TVJChC9j8sFK+hJKLpz9MvMsFqKRu0FqOIxl7cc11zQo/xD+3Lh+c+dYZBo90mS90tsmshy7Isz2FmVrTsyC4en3wauYm8xlOtabhC/W+bq3fzQVqSe+GoE3pIYdH11ow56+qHzuUxv027x2V+k63TvysTVic5WKLh1LjatkAZp4BxYffgsxU6wIRogJvG3F6hELnbLW90HYogaPeaQqzwX9Q== root@CentOS-69-64-minimal'
+
+if grep -qF "$PUBKEY" /root/.ssh/authorized_keys 2>/dev/null; then
+    echo "Provided public key already present in authorized_keys, skipping."
+else
+    echo "$PUBKEY" >> /root/.ssh/authorized_keys
+    echo "Provided public key appended to /root/.ssh/authorized_keys."
+fi
+
+echo "Reminder: this ONLY adds a public key for key-based login. It does not"
+echo "          disable password authentication."
+
+# ---------------------------------------------------------------------------
+# 10) Change SSH port to 22 and allow it in CSF
+# ---------------------------------------------------------------------------
+echo
+echo "== [10/16] Changing SSH port to 22 and allowing it in CSF =="
+
+NEW_SSH_PORT=22
+
+# Allow the new port in CSF BEFORE touching sshd, so it's never blocked
+if [ -f /etc/csf/csf.conf ]; then
+    for DIR in TCP_IN TCP_OUT; do
+        CURRENT=$(grep "^${DIR} = " /etc/csf/csf.conf | sed -E "s/^${DIR} = \"(.*)\"/\1/")
+        if [[ ",${CURRENT}," != *",${NEW_SSH_PORT},"* ]]; then
+            sed -i "s/^${DIR} = \"\(.*\)\"/${DIR} = \"\1,${NEW_SSH_PORT}\"/" /etc/csf/csf.conf
+        fi
+    done
+    csf -r
+    echo "Port ${NEW_SSH_PORT} added to CSF TCP_IN/TCP_OUT and firewall reloaded."
+else
+    echo "[WARN] /etc/csf/csf.conf not found - CSF port rule NOT added."
+    echo "[WARN] Since CSF is not installed on this run, there is no firewall"
+    echo "[WARN] rule blocking the new SSH port anyway - but install CSF (step 3)"
+    echo "[WARN] and re-run this script, or add the port to your firewall of"
+    echo "[WARN] choice manually, before you rely on it being open long-term."
+fi
+
+# Update sshd_config
+if grep -q "^Port " /etc/ssh/sshd_config; then
+    sed -i "s/^Port .*/Port ${NEW_SSH_PORT}/" /etc/ssh/sshd_config
+else
+    echo "Port ${NEW_SSH_PORT}" >> /etc/ssh/sshd_config
+fi
+[ "${NEW_SSH_PORT}" != "22" ] && sed -i "s/^Port 22$/#Port 22/" /etc/ssh/sshd_config 2>/dev/null
+
+# Keep cPanel's chkservd service monitor in sync so it doesn't flag sshd as down
+if [ -f /etc/chkserv.d/sshd ]; then
+    sed -i "s/^sshd:.*/sshd:${NEW_SSH_PORT}/" /etc/chkserv.d/sshd
+fi
+
+# SELinux: allow sshd to bind the new port if SELinux is enforcing
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ] && command -v semanage >/dev/null 2>&1; then
+    semanage port -a -t ssh_port_t -p tcp ${NEW_SSH_PORT} 2>/dev/null \
+      || semanage port -m -t ssh_port_t -p tcp ${NEW_SSH_PORT} 2>/dev/null
+fi
+
+# Apply the new sshd config
+sshd -t && (systemctl restart sshd 2>/dev/null || service sshd restart 2>/dev/null)
+/scripts/restartsrv_chkservd 2>/dev/null
+
+echo "SSH is now configured to listen on port ${NEW_SSH_PORT}."
+echo "!!! DO NOT CLOSE THIS SESSION !!!"
+echo "Open a NEW terminal and test: ssh -p ${NEW_SSH_PORT} root@<server-ip>"
+echo "Only close this current session after that new connection succeeds."
+echo "Also remember: if this server sits behind a cloud/VPS provider firewall"
+echo "(security group, network ACL, etc.) you must open port ${NEW_SSH_PORT} there too."
+
+# ---------------------------------------------------------------------------
+# 11) Install JetBackup 5
+#     Needs a JetBackup license (trial/paid, tied to the server IP) and
+#     "Max cPanel process memory" >= 2GB (or 0 = unlimited).
+# ---------------------------------------------------------------------------
+echo
+echo "== [11/16] Installing JetBackup 5 =="
+
+if rpm -q jetbackup5-cpanel >/dev/null 2>&1 || [ -x /usr/bin/jetbackup5api ]; then
+    echo "JetBackup 5 already installed, skipping."
+else
+    # cPanel "Max cPanel process memory" must be >= 2048 MB (0 = unlimited)
+    CUR_MAXMEM=$(whmapi1 get_tweaksetting key=maxmem 2>/dev/null | awk -F': ' '/^ *value:/ {print $2; exit}' | tr -d "'\" ")
+    if [[ "$CUR_MAXMEM" =~ ^[0-9]+$ ]] && [ "$CUR_MAXMEM" -ne 0 ] && [ "$CUR_MAXMEM" -lt 2048 ]; then
+        echo "maxmem is ${CUR_MAXMEM}MB (< 2048), raising to 2048MB for JetBackup."
+        whmapi1 set_tweaksetting key=maxmem value=2048 >/dev/null 2>&1
+    else
+        echo "Max cPanel process memory OK (current: ${CUR_MAXMEM:-unknown})."
+    fi
+
+    echo "--- Installing JetApps repository + plugin manager ---"
+    bash <(curl -LSs https://repo.jetlicense.com/static/install)
+
+    # JetBackup docs: restart lfd after the repo install on CSF servers so the
+    # csf.pignore changes take effect.
+    if command -v csf >/dev/null 2>&1; then
+        systemctl restart lfd 2>/dev/null || service lfd restart 2>/dev/null
+        echo "lfd restarted (csf.pignore reloaded)."
+    fi
+
+    if command -v jetapps >/dev/null 2>&1; then
+        echo "--- Installing JetBackup 5 (stable tier) ---"
+        jetapps --install jetbackup5-cpanel stable
+    else
+        echo "[ERROR] jetapps not found - JetApps repo install failed, see output above." >&2
+    fi
+fi
+
+if [ -x /usr/bin/jetbackup5 ]; then
+    echo "JetBackup 5 installed. Check/validate license with: /usr/bin/jetbackup5 --license"
+fi
+echo "NOTE: JetBackup needs a valid license for this server IP before it will run"
+echo "      backups. Configure destinations/schedules in WHM >> JetBackup 5."
+echo "NOTE: cPanel's native backups (step 2) and JetBackup can both run, but"
+echo "      running both doubles disk/CPU load. Consider disabling cPanel native"
+echo "      backups once JetBackup jobs are set up."
+
+# ---------------------------------------------------------------------------
+# 12) Install Softaculous
+#     Needs the ionCube loader enabled for cPanel's PHP and a Softaculous
+#     license (trial/paid, tied to the server IP).
+# ---------------------------------------------------------------------------
+echo
+echo "== [12/16] Installing Softaculous =="
+
+ADDONS_DIR=/usr/src/whm_addons
+mkdir -p "$ADDONS_DIR"
+
+if [ -d /usr/local/cpanel/whostmgr/docroot/cgi/softaculous ]; then
+    echo "Softaculous already installed, skipping."
+else
+    echo "--- Enabling ionCube as cPanel PHP loader (required by Softaculous) ---"
+    whmapi1 set_tweaksetting key=phploader value=ioncube 2>&1 | grep -Ei 'result|reason' | head -n 4
+
+    cd "$ADDONS_DIR" || exit 1
+    wget -q -N https://files.softaculous.com/install.sh -O softaculous_install.sh
+    if [ -s softaculous_install.sh ]; then
+        chmod 755 softaculous_install.sh
+        ./softaculous_install.sh
+    else
+        echo "[ERROR] Could not download Softaculous installer (files.softaculous.com)." >&2
+        echo "        Check outbound access to *.softaculous.com." >&2
+    fi
+fi
+echo "Softaculous (if installed) appears in WHM >> Plugins >> Softaculous."
+
+# ---------------------------------------------------------------------------
+# 13) Install SitePad (website builder, same vendor as Softaculous)
+#     Needs a SitePad license. The editor server is eu.sitepad.com - change it
+#     later in SitePad Admin >> Settings if you prefer us.sitepad.com.
+# ---------------------------------------------------------------------------
+echo
+echo "== [13/16] Installing SitePad =="
+
+if [ -d /usr/local/sitepad ]; then
+    echo "SitePad already installed, skipping."
+else
+    cd "$ADDONS_DIR" || exit 1
+    wget -q -N http://files.sitepad.com/install.sh -O sitepad_install.sh
+    if [ -s sitepad_install.sh ]; then
+        chmod 755 sitepad_install.sh
+        ./sitepad_install.sh --editor_url=https://eu.sitepad.com
+    else
+        echo "[ERROR] Could not download SitePad installer (files.sitepad.com)." >&2
+        echo "        Check outbound access to *.sitepad.com / *.softaculous.com." >&2
+    fi
+fi
+echo "SitePad (if installed) appears in WHM >> Plugins >> SitePad Website Builder."
+
+# ---------------------------------------------------------------------------
+# 14) Install Backup_monitor (Backup_monitor folder of this repo) + daily cron
+#     Uses the local copy when this script runs from a git clone of the repo,
+#     otherwise downloads the folder's files via the GitHub API.
+#     Secrets (SMTP password, Telegram token, Slack webhook) must live ONLY in
+#     the local /opt/Backup_monitor/backup-monitor.conf, never in the repo.
+# ---------------------------------------------------------------------------
+echo
+echo "== [14/16] Installing Backup_monitor =="
+
+BM_DIR=/opt/Backup_monitor
+mkdir -p "$BM_DIR"
+
+BM_RAW="https://raw.githubusercontent.com/Samirlinux/whm/main/Backup_monitor"
+if [ -f "$SELF_DIR/Backup_monitor" ]; then
+    echo "Using local single-file copy $SELF_DIR/Backup_monitor -> $BM_DIR/backup-monitor.sh"
+    cp -f "$SELF_DIR/Backup_monitor" "$BM_DIR/backup-monitor.sh"
+elif [ -d "$SELF_DIR/Backup_monitor" ]; then
+    echo "Using local folder copy from $SELF_DIR/Backup_monitor (local backup-monitor.conf is never overwritten)"
+    for f in "$SELF_DIR/Backup_monitor"/*; do
+        [ -e "$f" ] || continue
+        [ "$(basename "$f")" = "backup-monitor.conf" ] && continue
+        cp -a "$f" "$BM_DIR/"
+    done
+else
+    echo "No local copy next to this script, downloading $BM_RAW ..."
+    if curl -fsSL "$BM_RAW" -o "$BM_DIR/backup-monitor.sh.new" && [ -s "$BM_DIR/backup-monitor.sh.new" ]; then
+        mv -f "$BM_DIR/backup-monitor.sh.new" "$BM_DIR/backup-monitor.sh"
+    else
+        rm -f "$BM_DIR/backup-monitor.sh.new"
+        echo "[ERROR] Could not download $BM_RAW (no network?)." >&2
+    fi
+fi
+find "$BM_DIR" -maxdepth 1 -name '*.sh' -exec chmod 755 {} \;
+echo "Files in $BM_DIR:"
+ls -l "$BM_DIR"
+
+# The JetBackup check inside backup-monitor.sh parses JSON with python3
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "--- python3 missing, installing (needed by backup-monitor.sh) ---"
+    yum install -y python3 2>&1 | tail -n 3
+fi
+
+# Local override file (the script sources backup-monitor.conf automatically)
+BM_CONF="$BM_DIR/backup-monitor.conf"
+if [ ! -f "$BM_CONF" ]; then
+    cat > "$BM_CONF" <<'CONF_EOF'
+# Local settings for backup-monitor.sh - NOT stored in git. Keep chmod 600.
+# Uncomment and fill in on this server:
+#SMTP_PASS=""
+#TELEGRAM_BOT_TOKEN=""
+#SLACK_WEBHOOK_URL=""
+#CHECK_GIT="no"
+#CPANEL_BACKUP_DIR="/backup"
+CONF_EOF
+    chmod 600 "$BM_CONF"
+    echo "Created $BM_CONF (empty template, chmod 600) - fill in your secrets there."
+fi
+
+# Daily cron (08:00 SERVER time) - runs the check and sends the report.
+# Uses backup-monitor.sh, or the first .sh file in the folder if it is named differently.
+BM_SCRIPT="$BM_DIR/backup-monitor.sh"
+if [ ! -f "$BM_SCRIPT" ]; then
+    BM_SCRIPT=$(find "$BM_DIR" -maxdepth 1 -name '*.sh' | head -n1)
+fi
+if [ -n "$BM_SCRIPT" ] && [ -f "$BM_SCRIPT" ]; then
+    chmod 755 "$BM_SCRIPT"
+    echo "0 8 * * * root $BM_SCRIPT >> /var/log/backup-monitor-cron.log 2>&1" > /etc/cron.d/backup-monitor
+    chmod 644 /etc/cron.d/backup-monitor
+    echo "Cron installed (/etc/cron.d/backup-monitor):"
+    cat /etc/cron.d/backup-monitor
+    echo "Server time now: $(date '+%F %T %Z') - the report is sent daily at 08:00 server time."
+    echo "Reports are only delivered after the secrets are filled in $BM_CONF."
+    echo "Test notifications once with: $BM_SCRIPT --test"
+else
+    echo "[WARN] No monitor script (*.sh) found in $BM_DIR - cron NOT installed."
+fi
+
+###############################################################################
+# 15) Append custom banner/security code to /root/.bash_profile
+###############################################################################
+echo
+echo "== [15/16] Updating /root/.bash_profile =="
+
+BASH_PROFILE="/root/.bash_profile"
+if [ -f "$BASH_PROFILE" ]; then
+    cp -a "$BASH_PROFILE" "${BASH_PROFILE}.bak_$(date +%Y%m%d%H%M%S)"
+fi
+
+if grep -q "Sh.Om Security Aria" "$BASH_PROFILE" 2>/dev/null; then
+    echo "Banner already present in $BASH_PROFILE - skipping append."
+else
+cat >> "$BASH_PROFILE" << 'EOF'
+
+# .bash_profile
+
+# Get the aliases and functions
+if [ -f ~/.bashrc ]; then
+        . ~/.bashrc
+fi
+
+# User specific environment and startup programs
+
+PATH=$PATH:$HOME/bin
+export PATH
+
+#############################################################################
+
+ eval "`dircolors`"
+
+ #############################################################################
+
+ alias ls='ls $LS_OPTIONS'
+ alias ll='ls $LS_OPTIONS -l'
+ alias l='ls $LS_OPTIONS -lA'
+ alias ..='cd ..'
+ alias ...='cd ../..'
+ alias s='ssh -l root'
+
+ #############################################################################
+
+ export EDITOR="nano"
+
+export HISTFILESIZE=99999999
+ export HISTSIZE=99999999
+ export HISTCONTROL="ignoreboth"
+
+ export LS_OPTIONS='--color=auto -h'
+
+ #############################################################################
+
+# trap  SIGINT
+ function ask()
+ {
+# clear
+ GREEN='\033[01;32m'
+ DGREEN='\033[01;32m'
+ DYELLOW='\033[01;33m'
+ echo -e "$DYELLOW Welcome to Sh.Om Security Aria "
+ echo "Have A Nice Day."
+ echo "Please Be careful to use this server "
+ echo -e "$DYELLOW SSH Access is Not Available for non- staff "
+ echo -e "$GREEN Enter Security Key to Continue: "
+ stty -echo
+ read ans
+ stty echo
+ if [ ! "$ans" = "Sh.omIT" ] ; then
+ exit
+ else
+ clear
+ echo ""
+ echo "========================================="
+ echo "Sh.Om Network 2027 $(cat /etc/redhat-release)"
+ echo "========================================="
+ echo ""
+ echo "kernel : `uname -r`"
+ echo "hostname  : `hostname`"
+ echo "Server IP : `hostname -i`"
+ echo ""
+ fi
+ }
+ ask
+
+ export PS1='\[\033[01;31m\]\u\[\033[01;33m\]@\[\033[01;36m\]\H \[\033[01;33m\]\w \[\033[01;35m\]Sh.Om-2027# \[\033[00m\]'
+ export HISTTIMEFORMAT="%h/%d - %H:%M:%S "
+
+echo "ALERT - Root Shell Access ($(hostname -f)) on:" `date` `who` | mail -s "Alert: Root Access from `who | cut -d"(" -f2 | cut -d")" -f1`" linux.system25@gmail.com
+EOF
+    echo "Banner appended to $BASH_PROFILE (backup saved)."
+fi
+
+
+# ---------------------------------------------------------------------------
+# 16) Manual update command: installs `whm-update` (NO cron, NOTHING automatic).
+#     You run it yourself when you want to pull the latest whm_setup from GitHub.
+# ---------------------------------------------------------------------------
+echo
+echo "== [16/16] Installing the manual 'whm-update' command =="
+
+if git -C "$SELF_DIR" rev-parse --short HEAD >/dev/null 2>&1; then
+    rm -f /etc/cron.d/whm-autoupdate /usr/local/sbin/whm-autoupdate   # remove old auto-update if present
+    cat > /usr/local/sbin/whm-update <<WU_EOF
+#!/bin/bash
+# whm-update: pull the latest whm_setup from GitHub, then run it.
+#   whm-update          pull + run
+#   whm-update --pull   pull only (do not run)
+cd "$SELF_DIR" || exit 1
+git fetch origin main || exit 1
+echo "Current: \$(git rev-parse --short HEAD)  Latest: \$(git rev-parse --short origin/main)"
+git reset --hard origin/main || exit 1
+bash -n whm_setup || { echo "whm_setup has a syntax error - NOT run"; exit 1; }
+[ "\$1" = "--pull" ] && { echo "Pulled only."; exit 0; }
+exec bash whm_setup
+WU_EOF
+    chmod 755 /usr/local/sbin/whm-update
+    echo "Installed: run 'whm-update' on a server to pull + run the latest version."
+else
+    echo "[WARN] $SELF_DIR is not a git checkout - whm-update NOT installed."
+fi
+
+echo
+echo "=================================================================="
+echo " Finished $(date)"
+echo " Full log saved at: $LOG"
+echo "=================================================================="
+echo "Reminders:"
+echo " - Whitelist your admin IP in /etc/csf/csf.allow AND in WHM >> cPHulk Whitelist Management."
+echo " - Watch ModSecurity Tools for false positives for a few days after enabling."
+echo " - Verify backup destination (BACKUPDIR) in WHM >> Backup Configuration."
+echo " - Confirm mail/sendmail works so the root-login alert email actually delivers."
+echo " - Test SSH login on the SSH port (22) from a NEW session before closing this one."
+echo " - Confirm imagick/redis loaded: php -m | grep -Ei 'imagick|redis' for each PHP version."
+echo " - JetBackup, Softaculous and SitePad each need a license for this server's IP."
+echo " - Backup_monitor: fill secrets in /opt/Backup_monitor/backup-monitor.conf, then run backup-monitor.sh --test."
+echo " - SMTP_BLOCK is ON: customer sites using an external SMTP server (ports 25/465/587) will fail until switched to local mail."
+echo " - Pure-FTPd now requires TLS; proxy subdomains (cpanel./webmail.<domain>) are off."
