@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# cpanel-patch.sh
+# Author: Eng. Samir Abu El-Khair
+#
+# Applies the official cPanel & WHM security update, verifies the result,
+# and runs a few basic compromise checks.
+#
+# Usage (as root):   bash cpanel-patch.sh
+# Dry run:           bash cpanel-patch.sh --check
+#
+# NOTE: This script does NOT contain a custom fix. The only supported fix
+# for cPanel vulnerabilities is the official update (upcp) from cPanel.
+
+set -uo pipefail
+
+LOG="/var/log/cpanel-patch.log"
+CHECK_ONLY=0
+[[ "${1:-}" == "--check" ]] && CHECK_ONLY=1
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# ---------- Preconditions ----------
+if [[ $EUID -ne 0 ]]; then
+  echo "Run as root." >&2; exit 1
+fi
+if [[ ! -x /usr/local/cpanel/cpanel ]]; then
+  echo "cPanel & WHM not found on this server." >&2; exit 1
+fi
+
+cp_version() { /usr/local/cpanel/cpanel -V 2>/dev/null | awk '{print $1}'; }
+
+BEFORE="$(cp_version)"
+log "cPanel version before: ${BEFORE}"
+
+# ---------- Update ----------
+if [[ $CHECK_ONLY -eq 1 ]]; then
+  log "--check mode: skipping update."
+else
+  # Make sure automatic updates are on so future patches land by themselves.
+  if [[ -f /etc/cpupdate.conf ]]; then
+    cp -n /etc/cpupdate.conf /etc/cpupdate.conf.bak."$(date +%s)"
+    if grep -q '^UPDATES=' /etc/cpupdate.conf; then
+      sed -i 's/^UPDATES=.*/UPDATES=daily/' /etc/cpupdate.conf
+    else
+      echo "UPDATES=daily" >> /etc/cpupdate.conf
+    fi
+    log "Automatic updates set to daily."
+  fi
+
+  log "Running /scripts/upcp --force (this can take several minutes)..."
+  if /scripts/upcp --force >> "$LOG" 2>&1; then
+    log "upcp finished."
+  else
+    log "upcp reported errors. Check $LOG and /var/cpanel/updatelogs/."
+  fi
+
+  log "Restarting cpsrvd..."
+  /scripts/restartsrv_cpsrvd >> "$LOG" 2>&1 || log "cpsrvd restart failed."
+fi
+
+AFTER="$(cp_version)"
+log "cPanel version after:  ${AFTER}"
+
+if [[ "$BEFORE" == "$AFTER" && $CHECK_ONLY -eq 0 ]]; then
+  log "Version unchanged: either already up to date, or the update did not apply."
+  log "Compare ${AFTER} with the fixed version in the cPanel security advisory."
+fi
+
+# ---------- Basic compromise indicators ----------
+log "Running basic indicator checks..."
+
+# 1) Unexpected entries in ld.so.preload (should normally be absent/empty)
+if [[ -s /etc/ld.so.preload ]]; then
+  log "WARNING: /etc/ld.so.preload is not empty:"
+  cat /etc/ld.so.preload | tee -a "$LOG"
+else
+  log "OK: /etc/ld.so.preload is empty or absent."
+fi
+
+# 2) Recently modified files in cPanel core directories (last 3 days)
+RECENT="$(find /usr/local/cpanel/whostmgr /usr/local/cpanel/Cpanel \
+  -type f -mtime -3 2>/dev/null | head -n 20)"
+if [[ -n "$RECENT" ]]; then
+  log "Files modified in last 3 days (expected right after an update):"
+  echo "$RECENT" | tee -a "$LOG"
+fi
+
+# 3) Package integrity of cpanel
+if command -v rpm >/dev/null 2>&1; then
+  rpm -V cpanel >> "$LOG" 2>&1 && log "OK: rpm verify cpanel." \
+    || log "WARNING: rpm -V cpanel reported differences. Review $LOG."
+fi
+
+log "Done. Review $LOG. If you see warnings, rotate root/WHM passwords and API tokens."
