@@ -1,0 +1,296 @@
+
+#!/usr/bin/env bash
+
+# ============================================================
+# Project     : cPanel Domain Audit
+# Version     : 3.0
+# Developer   : Sameer Abu Elkhair
+# Attribution : Developed by Engineer Sameer Abu Elkhair
+# Description : cPanel/WHM Domain Audit and Monitoring Tool
+# Features    : Domain Expiration, Nameservers, DNS, Server IP,
+#               HTTP/HTTPS Status, SSL Verification, PHP Version,
+#               and CSV Reports
+# ============================================================
+
+set -u
+export LC_ALL=C
+umask 077
+
+OUT="/root/domain-audit-$(date +%F-%H%M%S).csv"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+# ------------------------------------------------------------
+# Check root privileges
+# ------------------------------------------------------------
+
+if [[ $EUID -ne 0 ]]; then
+    echo "[ERROR] Please run this script as root."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Check required commands
+# ------------------------------------------------------------
+
+for cmd in dig curl timeout awk sort paste date; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "[ERROR] Missing command: $cmd"
+        echo "Install the required package and try again."
+        exit 1
+    fi
+done
+
+if ! command -v whois >/dev/null 2>&1; then
+    echo "[WARNING] whois is not installed. Expiration dates may be unavailable."
+fi
+
+if [[ ! -r /etc/userdomains ]]; then
+    echo "[ERROR] /etc/userdomains not found."
+    echo "[ERROR] This does not appear to be a cPanel/WHM server."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# CSV escaping
+# ------------------------------------------------------------
+
+csv() {
+    local value="${1//$'\r'/}"
+    value="${value//\"/\"\"}"
+    printf '"%s"' "$value"
+}
+
+# ------------------------------------------------------------
+# HTTP status helper
+# ------------------------------------------------------------
+
+check_http() {
+    local url="$1"
+    local result
+
+    result=$(curl -sS -L \
+        --connect-timeout 5 \
+        --max-time 15 \
+        --max-redirs 5 \
+        -o /dev/null \
+        -w '%{http_code}' \
+        "$url" 2>/dev/null) || true
+
+    [[ -n "$result" ]] && printf '%s' "$result" || printf '000'
+}
+
+# ------------------------------------------------------------
+# Read domain inventory from cPanel
+# ------------------------------------------------------------
+
+awk -F': *' '
+    NF >= 2 {
+        domain = tolower($1)
+        user = $2
+
+        if (domain ~ /^[a-z0-9.-]+\.[a-z0-9.-]+$/ &&
+            domain !~ /^\./ &&
+            domain !~ /\.\./ &&
+            user ~ /^[a-zA-Z0-9_-]+$/) {
+            print domain "\t" user
+        }
+    }
+' /etc/userdomains | sort -u > "$TMP"
+
+TOTAL=$(wc -l < "$TMP" | tr -d ' ')
+
+if [[ "$TOTAL" -eq 0 ]]; then
+    echo "[WARNING] No domains found in /etc/userdomains."
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# Create CSV report
+# ------------------------------------------------------------
+
+printf '%s\n' \
+'"Domain","cPanel User","Expiration Date","Days Remaining","Nameservers","DNS IPv4","Server IP","HTTP Status","HTTPS Status","SSL Status","PHP Version","Website Status"' \
+> "$OUT"
+
+# ------------------------------------------------------------
+# Main audit
+# ------------------------------------------------------------
+
+COUNT=0
+
+while IFS=$'\t' read -r domain user; do
+    [[ -n "$domain" ]] || continue
+
+    COUNT=$((COUNT + 1))
+
+    echo "[$COUNT/$TOTAL] Auditing: $domain"
+
+    # ----------------------------------------
+    # Public nameservers
+    # ----------------------------------------
+
+    NS=$(dig +time=3 +tries=1 +short NS "$domain" 2>/dev/null |
+        sed 's/\.$//' |
+        sort -u |
+        paste -sd ';' -)
+
+    [[ -n "$NS" ]] || NS="Not found"
+
+    # ----------------------------------------
+    # Public IPv4 DNS records
+    # ----------------------------------------
+
+    DNS_IP=$(dig +time=3 +tries=1 +short A "$domain" 2>/dev/null |
+        grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' |
+        sort -u |
+        paste -sd ';' -)
+
+    [[ -n "$DNS_IP" ]] || DNS_IP="No A record"
+
+    # ----------------------------------------
+    # cPanel userdata
+    # ----------------------------------------
+
+    USERDATA="/var/cpanel/userdata/$user"
+    SERVER_IP="Unknown"
+    PHP="Unknown"
+
+    for FILE in "$USERDATA/$domain" "$USERDATA/${domain}_SSL"; do
+        [[ -r "$FILE" ]] || continue
+
+        if [[ "$SERVER_IP" == "Unknown" ]]; then
+            VALUE=$(awk '$1 == "IP:" {print $2; exit}' "$FILE")
+            [[ -n "$VALUE" ]] && SERVER_IP="$VALUE"
+        fi
+
+        if [[ "$PHP" == "Unknown" ]]; then
+            VALUE=$(awk '$1 == "phpversion:" {print $2; exit}' "$FILE")
+            [[ -n "$VALUE" ]] && PHP="$VALUE"
+        fi
+    done
+
+    # ----------------------------------------
+    # HTTP availability
+    # ----------------------------------------
+
+    HTTP=$(check_http "http://$domain")
+
+    # ----------------------------------------
+    # HTTPS availability
+    # ----------------------------------------
+
+    HTTPS=$(check_http "https://$domain")
+
+    # ----------------------------------------
+    # SSL certificate verification
+    # ----------------------------------------
+
+    SSL_STATUS="Unknown"
+
+    if [[ "$HTTPS" != "000" ]]; then
+        if curl -sS -L \
+            --connect-timeout 5 \
+            --max-time 15 \
+            --max-redirs 5 \
+            -o /dev/null \
+            "https://$domain" 2>/dev/null; then
+            SSL_STATUS="Valid"
+        else
+            SSL_STATUS="Invalid or connection error"
+        fi
+    else
+        SSL_STATUS="HTTPS unavailable"
+    fi
+
+    # ----------------------------------------
+    # Domain expiration via WHOIS
+    # ----------------------------------------
+
+    EXPIRY="Unavailable"
+    DAYS="Unknown"
+
+    if command -v whois >/dev/null 2>&1; then
+        WHOIS_DATA=$(timeout 12 whois "$domain" 2>/dev/null || true)
+
+        RAW_EXPIRY=$(printf '%s\n' "$WHOIS_DATA" | awk '
+            BEGIN { IGNORECASE=1 }
+            /^[[:space:]]*(Registry Expiry Date|Registrar Registration Expiration Date|Registry Expiration Date|Expiration Date|Expiry Date|Expires On|Expires|paid-till|Domain Expiration Date|Domain expires|expire):/ {
+                sub(/^[^:]*:[[:space:]]*/, "")
+                if ($0 != "") {
+                    print
+                    exit
+                }
+            }
+        ')
+
+        if [[ -n "$RAW_EXPIRY" ]]; then
+            NORMALIZED=$(date -d "$RAW_EXPIRY" +%F 2>/dev/null || true)
+
+            if [[ -n "$NORMALIZED" ]]; then
+                EXPIRY="$NORMALIZED"
+
+                END_TS=$(date -d "$NORMALIZED 00:00:00" +%s 2>/dev/null || true)
+                NOW_TS=$(date +%s)
+
+                if [[ -n "$END_TS" ]]; then
+                    DAYS=$(( (END_TS - NOW_TS) / 86400 ))
+                fi
+            fi
+        fi
+    fi
+
+    # ----------------------------------------
+    # Determine website status
+    # ----------------------------------------
+
+    if [[ "$HTTP" == "000" && "$HTTPS" == "000" ]]; then
+        WEBSITE_STATUS="Unreachable"
+    elif [[ "$HTTP" =~ ^5[0-9][0-9]$ ||
+            "$HTTPS" =~ ^5[0-9][0-9]$ ]]; then
+        WEBSITE_STATUS="Server Error"
+    elif [[ "$HTTP" =~ ^4[0-9][0-9]$ ||
+            "$HTTPS" =~ ^4[0-9][0-9]$ ]]; then
+        WEBSITE_STATUS="HTTP Client Error"
+    elif [[ "$HTTP" =~ ^[23][0-9][0-9]$ ||
+            "$HTTPS" =~ ^[23][0-9][0-9]$ ]]; then
+        WEBSITE_STATUS="Responding"
+    else
+        WEBSITE_STATUS="Check Required"
+    fi
+
+    # ----------------------------------------
+    # Write CSV row
+    # ----------------------------------------
+
+    {
+        csv "$domain";        printf ','
+        csv "$user";          printf ','
+        csv "$EXPIRY";        printf ','
+        csv "$DAYS";          printf ','
+        csv "$NS";            printf ','
+        csv "$DNS_IP";        printf ','
+        csv "$SERVER_IP";     printf ','
+        csv "$HTTP";          printf ','
+        csv "$HTTPS";         printf ','
+        csv "$SSL_STATUS";    printf ','
+        csv "$PHP";           printf ','
+        csv "$WEBSITE_STATUS"
+        printf '\n'
+    } >> "$OUT"
+
+done < "$TMP"
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo " cPanel Domain Audit v3.0"
+echo " Developed by Engineer Sameer Abu Elkhair"
+echo "============================================================"
+echo "Total domains checked : $COUNT"
+echo "CSV report             : $OUT"
+echo "Audit completed."
+echo "============================================================"
