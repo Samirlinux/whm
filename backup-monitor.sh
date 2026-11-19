@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  cPanel Backup Monitor v1.1
+#  Author : Eng. Samir Abou El Khair
+#
+#  Checks, by itself and without manual steps:
+#    1. cPanel internal backup  (latest dated folder, age, accounts, disk use)
+#    2. JetBackup 5             (runs in the last N hours: completed/partial/failed)
+#    3. External copy           (connects over SSH to the remote server and checks
+#                                that the newest file is recent - real proof that
+#                                the offsite copy arrived)
+#  Then sends ONE report to Email (SMTP/sendmail) + Telegram + Slack.
+#
+#  Usage:
+#    backup-monitor.sh              run the checks and send the report
+#    backup-monitor.sh --dry-run    run the checks, print the report, send nothing
+#    backup-monitor.sh --test       send a test message to all enabled channels
+#    backup-monitor.sh --debug-jb   print raw JetBackup API output (for tuning)
+#    backup-monitor.sh --help
+#
+#  Secrets live in backup-monitor.conf (never commit it - see .gitignore).
+#  Exit code: 0 = OK, 1 = WARN, 2 = FAIL
+# ==============================================================================
+
+export PATH=/usr/local/cpanel/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+
+VERSION="1.1"
+AUTHOR="Eng. Samir Abou El Khair"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${BM_CONF:-${SCRIPT_DIR}/backup-monitor.conf}"
+HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
+
+# ----------------------------- defaults ---------------------------------------
+LOG_FILE="/var/log/cpanel-backup-monitor.log"
+NOTIFY_ON="always"                 # always | problem (send only on WARN/FAIL)
+
+CPANEL_BACKUP_DIR="/backup"
+CP_MAX_AGE_H=30                    # older than this -> WARN (2x -> FAIL)
+DISK_WARN_PCT=85
+DISK_FAIL_PCT=95
+
+JB_ENABLED="yes"
+JB_WINDOW_H=26
+JB_TYPE_FILTER=""                  # empty = all queue groups; set a type id to filter
+# JetBackup queue status codes. Verify on your server with: --debug-jb
+# Any code not listed here is reported as WARN ("unknown status"), never as OK.
+JB_ST_COMPLETED="100"
+JB_ST_PARTIAL="101"
+JB_ST_RUNNING="1 2 3"
+JB_ST_FAILED="102 200 201"
+
+EXT_VERIFY="no"
+EXT_SSH_HOST=""
+EXT_SSH_USER=""
+EXT_SSH_PORT=22
+EXT_SSH_KEY="/root/.ssh/id_rsa"
+EXT_PATH=""                        # backup directory of the destination (remote path)
+EXT_MAX_AGE_H=30                   # newest remote file older than this -> WARN (2x -> FAIL)
+
+EMAIL_ENABLED="no"
+EMAIL_METHOD="smtp"                # smtp | sendmail
+EMAIL_TO=""
+EMAIL_FROM="backup-monitor@${HOSTNAME_FQDN}"   # sendmail mode only
+SMTP_HOST="smtp.gmail.com"; SMTP_PORT=465
+SMTP_USER=""; SMTP_PASS=""
+
+TELEGRAM_ENABLED="no"
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""                # empty = auto-detected after pressing Start on the bot
+
+SLACK_ENABLED="no"
+SLACK_WEBHOOK_URL=""
+
+# ----------------------------- load config ------------------------------------
+if [[ -f "$CONF" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF"
+fi
+
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/cpanel-backup-monitor.log"
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+
+if [[ -f "$CONF" ]]; then
+  perm="$(stat -c %a "$CONF" 2>/dev/null)"
+  [[ "$perm" == "600" || "$perm" == "400" ]] || log "WARNING: ${CONF} permissions are ${perm}, run: chmod 600 ${CONF}"
+else
+  log "WARNING: config file not found (${CONF}) - using defaults, notifications are disabled"
+fi
+
+# ----------------------------- helpers ----------------------------------------
+LEVEL=0; REPORT=""; SUBJECT=""; BODY=""
+raise() { (( $1 > LEVEL )) && LEVEL=$1; }
+add()   { REPORT+="$*"$'\n'; }
+icon()  { case "$1" in 0) echo "✅";; 1) echo "⚠️";; *) echo "❌";; esac; }
+lname() { case "$1" in 0) echo "OK";; 1) echo "WARN";; *) echo "FAIL";; esac; }
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r//g' \
+    | awk '{printf "%s\\n", $0}'
+}
+
+# ----------------------------- check 1: cPanel --------------------------------
+check_cpanel() {
+  local lvl=0 sec="" latest newest now age_h total backed pct use dests
+  now=$(date +%s)
+
+  if [[ ! -d "$CPANEL_BACKUP_DIR" ]]; then
+    add "$(icon 2) cPanel internal backup : FAIL"
+    add "Problem   : ${CPANEL_BACKUP_DIR} not found"; add ""; raise 2; return
+  fi
+
+  latest=$(find "$CPANEL_BACKUP_DIR" -maxdepth 1 -type d -name '20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]' 2>/dev/null | sort | tail -1)
+  if [[ -z "$latest" ]]; then
+    add "$(icon 2) cPanel internal backup : FAIL"
+    add "Problem   : no dated backup folder in ${CPANEL_BACKUP_DIR}"; add ""; raise 2; return
+  fi
+
+  newest=$(find "$latest" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+  newest="${newest%.*}"
+  sec+="Folder    : ${latest}"$'\n'
+  if [[ -z "$newest" ]]; then
+    lvl=2; sec+="Problem   : backup folder is empty"$'\n'
+  else
+    age_h=$(( (now - newest) / 3600 ))
+    sec+="Last file : ${age_h}h ago"$'\n'
+    if   (( age_h > CP_MAX_AGE_H * 2 )); then lvl=2; sec+="Problem   : last backup file is older than $((CP_MAX_AGE_H*2))h"$'\n'
+    elif (( age_h > CP_MAX_AGE_H ));     then (( lvl < 1 )) && lvl=1; sec+="Warning   : last backup file is older than ${CP_MAX_AGE_H}h"$'\n'
+    fi
+  fi
+
+  total=$(ls -1 /var/cpanel/users 2>/dev/null | grep -Evc '^(root|nobody|cpanel|system|cpanelphpmyadmin|cpanelphppgadmin|cpanelroundcube|cpses)$')
+  backed=$(find "$latest/accounts" -mindepth 1 -maxdepth 1 \( -name '*.tar.gz' -o -name '*.tar' -o -type d \) 2>/dev/null | wc -l)
+  if (( total > 0 )); then pct=$(( backed * 100 / total )); else pct=100; fi
+  sec+="Accounts  : ${backed} backed up / ${total} on server (${pct}%)"$'\n'
+  if   (( pct < 90 )); then lvl=2; sec+="Problem   : less than 90% of accounts were backed up"$'\n'
+  elif (( backed < total )); then (( lvl < 1 )) && lvl=1; sec+="Warning   : $((total - backed)) account(s) missing from the backup"$'\n'
+  fi
+
+  use=$(df --output=pcent "$CPANEL_BACKUP_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [[ -n "$use" ]]; then
+    sec+="Disk use  : ${use}% on the backup partition"$'\n'
+    if   (( use >= DISK_FAIL_PCT )); then lvl=2; sec+="Problem   : backup partition almost full"$'\n'
+    elif (( use >= DISK_WARN_PCT )); then (( lvl < 1 )) && lvl=1; sec+="Warning   : backup partition above ${DISK_WARN_PCT}%"$'\n'
+    fi
+  fi
+
+  dests=$(whmapi1 backup_destination_list 2>/dev/null | grep -c 'disabled: 0')
+  sec+="Remote destinations (cPanel) : ${dests} enabled"$'\n'
+
+  add "$(icon $lvl) cPanel internal backup : $(lname $lvl)"
+  add "${sec%$'\n'}"; add ""; raise $lvl
+}
+
+# ----------------------------- check 2: JetBackup -----------------------------
+jb_parse() {
+python3 -c '
+import sys, json, time
+win, tf, c, p, r, f = sys.argv[1:7]
+sets = [set(x.split()) for x in (c, p, r, f)]
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print("ERR not-json"); sys.exit(0)
+if d.get("success") not in (1, True, "1"):
+    print("ERR api-reported-failure"); sys.exit(0)
+groups = (d.get("data") or {}).get("groups") or []
+if isinstance(groups, dict):
+    groups = list(groups.values())
+lim = time.time() - int(win) * 3600
+n = [0, 0, 0, 0, 0]; tot = 0; last = 0.0; unk = set()
+for g in groups:
+    if not isinstance(g, dict): continue
+    if tf and str(g.get("type")) != tf: continue
+    ts = 0.0
+    for k in ("created", "started", "ended", "updated"):
+        try: ts = max(ts, float(g.get(k)))
+        except Exception: pass
+    if ts < lim: continue
+    tot += 1
+    st = str(g.get("status"))
+    for i, s in enumerate(sets):
+        if st in s:
+            n[i] += 1; break
+    else:
+        n[4] += 1; unk.add(st)
+    try: last = max(last, float(g.get("ended") or 0))
+    except Exception: pass
+print("OK", tot, *n, int(last), ",".join(sorted(unk)) or "-")
+' "$@"
+}
+
+check_jetbackup() {
+  [[ "$JB_ENABLED" == "yes" ]] || return 0
+  local api raw out st total completed partial running failed other lastend unk lvl=0 sec="" now age_h
+  api="$(command -v jetbackup5api || true)"
+  if [[ -z "$api" ]]; then
+    add "$(icon 1) JetBackup : WARN"; add "Warning   : jetbackup5api not found"; add ""; raise 1; return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    add "$(icon 1) JetBackup : WARN"; add "Warning   : python3 not found (needed to read the API output)"; add ""; raise 1; return
+  fi
+
+  raw="$("$api" -F listQueueGroups -O json 2>&1)"
+  out="$(printf '%s' "$raw" | jb_parse "$JB_WINDOW_H" "$JB_TYPE_FILTER" "$JB_ST_COMPLETED" "$JB_ST_PARTIAL" "$JB_ST_RUNNING" "$JB_ST_FAILED" 2>&1)"
+  read -r st total completed partial running failed other lastend unk <<< "$out"
+
+  if [[ "$st" != "OK" ]]; then
+    add "$(icon 1) JetBackup : WARN"
+    add "Warning   : could not read JetBackup status (${out}) - run: $0 --debug-jb"
+    add ""; raise 1; return
+  fi
+
+  now=$(date +%s)
+  sec+="Backup runs : last ${JB_WINDOW_H}h -> ${total} total | ${completed} completed | ${partial} partial | ${running} running | ${failed} failed"$'\n'
+  if (( lastend > 0 )); then age_h=$(( (now - lastend) / 3600 )); sec+="Last finish : ${age_h}h ago"$'\n'; fi
+
+  if   (( total == 0 ));     then lvl=1; sec+="Warning   : no JetBackup runs in the last ${JB_WINDOW_H}h"$'\n'
+  elif (( failed > 0 ));     then lvl=2; sec+="Problem   : ${failed} failed run(s)"$'\n'
+  fi
+  if (( partial > 0 )); then (( lvl < 1 )) && lvl=1; sec+="Warning   : ${partial} partially completed run(s)"$'\n'; fi
+  if (( other > 0 ));   then (( lvl < 1 )) && lvl=1; sec+="Warning   : ${other} run(s) with unknown status code(s): ${unk} (adjust JB_ST_* in the config)"$'\n'; fi
+  if (( total > 0 && completed == 0 && running == 0 && failed == 0 && partial == 0 )); then (( lvl < 1 )) && lvl=1; fi
+
+  add "$(icon $lvl) JetBackup : $(lname $lvl)"
+  add "${sec%$'\n'}"; add ""; raise $lvl
+}
+
+# ----------------------------- check 3: external copy over SSH ----------------
+check_external() {
+  [[ "$EXT_VERIFY" == "yes" ]] || return 0
+  local lvl=0 sec="" out errf newest recent now age_h
+  if [[ -z "$EXT_SSH_HOST" || -z "$EXT_SSH_USER" || -z "$EXT_PATH" ]]; then
+    add "$(icon 1) External copy : WARN"; add "Warning   : EXT_SSH_HOST / EXT_SSH_USER / EXT_PATH not set"; add ""; raise 1; return
+  fi
+
+  errf="$(mktemp)"
+  out="$(ssh -i "$EXT_SSH_KEY" -p "$EXT_SSH_PORT" \
+        -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new \
+        "${EXT_SSH_USER}@${EXT_SSH_HOST}" 'bash -s' 2>"$errf" <<EOF
+[ -d "$EXT_PATH" ] || { echo NODIR; exit 0; }
+echo "NEWEST \$(find "$EXT_PATH" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)"
+echo "RECENT \$(find "$EXT_PATH" -type f -mmin -$((EXT_MAX_AGE_H * 60)) 2>/dev/null | wc -l)"
+EOF
+  )"
+
+  if [[ -z "$out" ]]; then
+    lvl=2; sec+="Problem   : SSH to ${EXT_SSH_HOST} failed - $(head -c 160 "$errf" | tr '\n' ' ')"$'\n'
+  elif [[ "$out" == *NODIR* ]]; then
+    lvl=2; sec+="Problem   : remote path ${EXT_PATH} does not exist on ${EXT_SSH_HOST}"$'\n'
+  else
+    newest="$(printf '%s\n' "$out" | awk '$1=="NEWEST"{print $2}')"; newest="${newest%.*}"
+    recent="$(printf '%s\n' "$out" | awk '$1=="RECENT"{print $2}')"
+    if [[ ! "$newest" =~ ^[0-9]+$ ]]; then
+      lvl=2; sec+="Problem   : connected to ${EXT_SSH_HOST} but no files found in ${EXT_PATH}"$'\n'
+    else
+      now=$(date +%s); age_h=$(( (now - newest) / 3600 ))
+      sec+="Verified over SSH on ${EXT_SSH_HOST}:${EXT_PATH}"$'\n'
+      sec+="Newest file : ${age_h}h old | files written in the last ${EXT_MAX_AGE_H}h : ${recent:-0}"$'\n'
+      if   (( age_h > EXT_MAX_AGE_H * 2 )); then lvl=2; sec+="Problem   : external copy is stale (older than $((EXT_MAX_AGE_H*2))h)"$'\n'
+      elif (( age_h > EXT_MAX_AGE_H ));     then lvl=1; sec+="Warning   : external copy is older than ${EXT_MAX_AGE_H}h"$'\n'
+      fi
+    fi
+  fi
+  rm -f "$errf"
+
+  add "$(icon $lvl) External copy (direct check) : $(lname $lvl)"
+  add "${sec%$'\n'}"; add ""; raise $lvl
+}
+
+# ----------------------------- notifications ----------------------------------
+send_email() {
+  [[ "$EMAIL_ENABLED" == "yes" && -n "$EMAIL_TO" ]] || return 0
+  local msg from subj_b64 out a arr rcpt=() extra=() url
+  msg="$(mktemp)"
+  from="$EMAIL_FROM"; [[ "$EMAIL_METHOD" == "smtp" ]] && from="$SMTP_USER"
+  subj_b64="$(printf '%s' "$SUBJECT" | base64 -w0)"
+  {
+    echo "From: Backup Monitor <${from}>"
+    echo "To: ${EMAIL_TO}"
+    echo "Subject: =?UTF-8?B?${subj_b64}?="
+    echo "Date: $(date -R)"
+    echo "MIME-Version: 1.0"
+    echo "Content-Type: text/plain; charset=UTF-8"
+    echo "Content-Transfer-Encoding: 8bit"
+    echo
+    printf '%s\n' "$BODY"
+  } > "$msg"
+
+  if [[ "$EMAIL_METHOD" == "smtp" ]]; then
+    if [[ -z "$SMTP_USER" || -z "$SMTP_PASS" ]]; then log "Email: SMTP_USER/SMTP_PASS not set - skipped"; rm -f "$msg"; return 0; fi
+    url="smtps://${SMTP_HOST}:${SMTP_PORT}"
+    if [[ "$SMTP_PORT" != "465" ]]; then url="smtp://${SMTP_HOST}:${SMTP_PORT}"; extra=(--ssl-reqd); fi
+    IFS=',' read -ra arr <<< "$EMAIL_TO"
+    for a in "${arr[@]}"; do a="${a// /}"; [[ -n "$a" ]] && rcpt+=(--mail-rcpt "$a"); done
+    out=$(curl -sS -m 60 ${extra[@]+"${extra[@]}"} --url "$url" \
+          --user "${SMTP_USER}:${SMTP_PASS}" --mail-from "$SMTP_USER" \
+          "${rcpt[@]}" -T "$msg" 2>&1) \
+      && log "Email(SMTP): sent to ${EMAIL_TO}" || log "Email(SMTP): FAILED - ${out}"
+  else
+    local sm; sm="$(command -v sendmail || echo /usr/sbin/sendmail)"
+    if [[ ! -x "$sm" ]]; then log "Email: sendmail not found"; rm -f "$msg"; return 1; fi
+    "$sm" -t -oi < "$msg" && log "Email: sent to ${EMAIL_TO}" || log "Email: FAILED"
+  fi
+  rm -f "$msg"
+}
+
+resolve_telegram_chat_id() {
+  local f="${SCRIPT_DIR}/.telegram_chat_id" id
+  [[ -n "$TELEGRAM_CHAT_ID" ]] && return 0
+  if [[ -s "$f" ]]; then TELEGRAM_CHAT_ID="$(cat "$f")"; return 0; fi
+  id=$(curl -sS -m 30 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" 2>/dev/null \
+       | grep -o '"chat":{"id":-\?[0-9]*' | head -1 | grep -o -- '-\?[0-9]*$')
+  if [[ -n "$id" ]]; then
+    TELEGRAM_CHAT_ID="$id"; echo "$id" > "$f" 2>/dev/null
+    log "Telegram: chat id auto-detected ($id)"
+  fi
+}
+
+send_telegram() {
+  [[ "$TELEGRAM_ENABLED" == "yes" && -n "$TELEGRAM_BOT_TOKEN" ]] || return 0
+  resolve_telegram_chat_id
+  if [[ -z "$TELEGRAM_CHAT_ID" ]]; then
+    log "Telegram: no chat id yet - open the bot in Telegram and press Start, then run again"; return 1
+  fi
+  local text resp
+  text="${SUBJECT}"$'\n\n'"${BODY}"; text="${text:0:3900}"
+  resp=$(curl -sS -m 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+         -d chat_id="$TELEGRAM_CHAT_ID" --data-urlencode "text=${text}" 2>&1)
+  if echo "$resp" | grep -q '"ok":true'; then log "Telegram: sent"; else log "Telegram: FAILED - $resp"; fi
+}
+
+send_slack() {
+  [[ "$SLACK_ENABLED" == "yes" && -n "$SLACK_WEBHOOK_URL" ]] || return 0
+  local payload resp
+  payload="{\"text\":\"$(json_escape "${SUBJECT}"$'\n\n'"${BODY}")\"}"
+  resp=$(curl -sS -m 30 -X POST -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" 2>&1)
+  if [[ "$resp" == "ok" ]]; then log "Slack: sent"; else log "Slack: FAILED - $resp"; fi
+}
+
+notify_all() { send_email; send_telegram; send_slack; }
+
+# ----------------------------- main -------------------------------------------
+usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+
+LOCK="/var/run/backup-monitor.lock"
+if ( : > "$LOCK" ) 2>/dev/null; then
+  exec 9>"$LOCK"
+  flock -n 9 || { echo "Another run is in progress - exiting"; exit 0; }
+fi
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --test)
+    SUBJECT="[TEST] Backup Monitor - ${HOSTNAME_FQDN}"
+    BODY="This is a test notification from cPanel Backup Monitor v${VERSION} ✅"
+    notify_all
+    echo "Test notification sent. Check ${LOG_FILE} for details."
+    exit 0 ;;
+  --debug-jb)
+    command -v jetbackup5api >/dev/null 2>&1 || { echo "jetbackup5api not found"; exit 1; }
+    jetbackup5api -F listQueueGroups -O json 2>&1 | head -c 6000; echo
+    exit 0 ;;
+  ""|--dry-run) ;;
+  *) echo "Unknown option: $1"; usage; exit 1 ;;
+esac
+
+log "Run started (v${VERSION}) on ${HOSTNAME_FQDN}"
+check_cpanel
+check_jetbackup
+check_external
+
+SUBJECT="[$(lname $LEVEL)] Backup report - ${HOSTNAME_FQDN}"
+BODY="$(icon $LEVEL) Backup Report - ${HOSTNAME_FQDN}"$'\n'
+BODY+="Date    : $(date '+%F %T %Z')"$'\n'
+BODY+="Overall : $(lname $LEVEL)"$'\n\n'
+BODY+="${REPORT}"$'\n'
+BODY+="-- cPanel Backup Monitor v${VERSION} | ${AUTHOR}"
+
+log "Overall: $(lname $LEVEL)"
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+  echo; echo "$SUBJECT"; echo "$BODY"; exit "$LEVEL"
+fi
+
+if [[ "$NOTIFY_ON" == "problem" && $LEVEL -eq 0 ]]; then
+  log "Everything OK and NOTIFY_ON=problem - no notification sent"
+else
+  notify_all
+fi
+exit "$LEVEL"
