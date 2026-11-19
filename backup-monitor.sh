@@ -35,14 +35,16 @@ LOG_FILE="/var/log/cpanel-backup-monitor.log"
 NOTIFY_ON="always"                 # always | problem (send only on WARN/FAIL)
 
 CPANEL_BACKUP_DIR="/backup"
+CPANEL_USERS_DIR="/var/cpanel/users"
 CP_MAX_AGE_H=30                    # older than this -> WARN (2x -> FAIL)
 DISK_WARN_PCT=85
 DISK_FAIL_PCT=95
 
 JB_ENABLED="yes"
 JB_WINDOW_H=26
-JB_TYPE_FILTER=""                  # empty = all queue groups; set a type id to filter
-# JetBackup queue status codes. Verify on your server with: --debug-jb
+JB_QUEUE_TYPE=1                    # JetBackup queue type 1 = backups
+# JetBackup queue status codes (100 = completed, 101 = partially completed: confirmed).
+# The failed codes are a guess; verify on your server with: --debug-jb
 # Any code not listed here is reported as WARN ("unknown status"), never as OK.
 JB_ST_COMPLETED="100"
 JB_ST_PARTIAL="101"
@@ -101,8 +103,12 @@ json_escape() {
 }
 
 # ----------------------------- check 1: cPanel --------------------------------
+cp_count()  { find "$1/accounts" -mindepth 1 -maxdepth 1 \( -name '*.tar.gz' -o -name '*.tar' -o -type d \) 2>/dev/null | wc -l; }
+cp_newest() { local n; n=$(find "$1" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1); echo "${n%.*}"; }
+
 check_cpanel() {
-  local lvl=0 sec="" latest newest now age_h total backed pct use dests
+  local lvl=0 sec="" now age_h total backed=0 pct use dests newest="" latest="" inprog="" d b n
+  local dirs=()
   now=$(date +%s)
 
   if [[ ! -d "$CPANEL_BACKUP_DIR" ]]; then
@@ -110,14 +116,27 @@ check_cpanel() {
     add "Problem   : ${CPANEL_BACKUP_DIR} not found"; add ""; raise 2; return
   fi
 
-  latest=$(find "$CPANEL_BACKUP_DIR" -maxdepth 1 -type d -name '20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]' 2>/dev/null | sort | tail -1)
+  total=$(ls -1 "$CPANEL_USERS_DIR" 2>/dev/null | grep -Evc '^(root|nobody|cpanel|system|cpanelphpmyadmin|cpanelphppgadmin|cpanelroundcube|cpses)$')
+
+  mapfile -t dirs < <(find "$CPANEL_BACKUP_DIR" -maxdepth 1 -type d -name '20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]' 2>/dev/null | sort -r)
+  for d in "${dirs[@]}"; do
+    b=$(cp_count "$d"); n=$(cp_newest "$d")
+    # newest folder still being written (files changed < 1h ago, not all accounts yet) = backup running now
+    if [[ -z "$latest" && -z "$inprog" && -n "$n" ]] && (( b < total && now - n < 3600 )); then
+      inprog="${d##*/} : ${b}/${total} accounts so far (backup is running now)"
+      continue
+    fi
+    latest="$d"; backed=$b; newest=$n; break
+  done
+
   if [[ -z "$latest" ]]; then
-    add "$(icon 2) cPanel internal backup : FAIL"
-    add "Problem   : no dated backup folder in ${CPANEL_BACKUP_DIR}"; add ""; raise 2; return
+    lvl=2; [[ -n "$inprog" ]] && lvl=1
+    add "$(icon $lvl) cPanel internal backup : $(lname $lvl)"
+    add "Problem   : no completed backup folder found in ${CPANEL_BACKUP_DIR}"
+    [[ -n "$inprog" ]] && add "Running   : ${inprog}"
+    add ""; raise $lvl; return
   fi
 
-  newest=$(find "$latest" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
-  newest="${newest%.*}"
   sec+="Folder    : ${latest}"$'\n'
   if [[ -z "$newest" ]]; then
     lvl=2; sec+="Problem   : backup folder is empty"$'\n'
@@ -129,13 +148,12 @@ check_cpanel() {
     fi
   fi
 
-  total=$(ls -1 /var/cpanel/users 2>/dev/null | grep -Evc '^(root|nobody|cpanel|system|cpanelphpmyadmin|cpanelphppgadmin|cpanelroundcube|cpses)$')
-  backed=$(find "$latest/accounts" -mindepth 1 -maxdepth 1 \( -name '*.tar.gz' -o -name '*.tar' -o -type d \) 2>/dev/null | wc -l)
   if (( total > 0 )); then pct=$(( backed * 100 / total )); else pct=100; fi
   sec+="Accounts  : ${backed} backed up / ${total} on server (${pct}%)"$'\n'
   if   (( pct < 90 )); then lvl=2; sec+="Problem   : less than 90% of accounts were backed up"$'\n'
   elif (( backed < total )); then (( lvl < 1 )) && lvl=1; sec+="Warning   : $((total - backed)) account(s) missing from the backup"$'\n'
   fi
+  [[ -n "$inprog" ]] && sec+="Running   : ${inprog}"$'\n'
 
   use=$(df --output=pcent "$CPANEL_BACKUP_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
   if [[ -n "$use" ]]; then
@@ -153,46 +171,62 @@ check_cpanel() {
 }
 
 # ----------------------------- check 2: JetBackup -----------------------------
+# Output: first line  S|jobs|completed|partial|running|failed|other|lastend|unknown-codes
+#         then one line per job (latest run inside the window):
+#         G|class|job name|status|items done|items|ended-ts|log file
 jb_parse() {
 python3 -c '
-import sys, json, time
-win, tf, c, p, r, f = sys.argv[1:7]
-sets = [set(x.split()) for x in (c, p, r, f)]
+import sys, json, time, calendar
+win, c, p, r, f = sys.argv[1:6]
+sets = [("C", set(c.split())), ("P", set(p.split())), ("R", set(r.split())), ("F", set(f.split()))]
+def ts(v):
+    if v in (None, ""): return 0
+    try: return float(v)
+    except Exception: pass
+    s = str(v); off = 0
+    try:
+        if len(s) >= 25 and s[-6] in "+-" and s[-3] == ":":
+            off = (int(s[-5:-3]) * 3600 + int(s[-2:]) * 60) * (1 if s[-6] == "+" else -1); s = s[:-6]
+        elif s.endswith("Z"): s = s[:-1]
+        return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) - off
+    except Exception: return 0
 try:
     d = json.loads(sys.stdin.read())
 except Exception:
     print("ERR not-json"); sys.exit(0)
 if d.get("success") not in (1, True, "1"):
-    print("ERR api-reported-failure"); sys.exit(0)
+    print("ERR api: " + str(d.get("message", ""))[:80].replace("|", "/")); sys.exit(0)
 groups = (d.get("data") or {}).get("groups") or []
-if isinstance(groups, dict):
-    groups = list(groups.values())
+if isinstance(groups, dict): groups = list(groups.values())
 lim = time.time() - int(win) * 3600
-n = [0, 0, 0, 0, 0]; tot = 0; last = 0.0; unk = set()
+latest = {}; last = 0; unk = set()
 for g in groups:
     if not isinstance(g, dict): continue
-    if tf and str(g.get("type")) != tf: continue
-    ts = 0.0
-    for k in ("created", "started", "ended", "updated"):
-        try: ts = max(ts, float(g.get(k)))
-        except Exception: pass
-    if ts < lim: continue
-    tot += 1
-    st = str(g.get("status"))
-    for i, s in enumerate(sets):
-        if st in s:
-            n[i] += 1; break
-    else:
-        n[4] += 1; unk.add(st)
-    try: last = max(last, float(g.get("ended") or 0))
-    except Exception: pass
-print("OK", tot, *n, int(last), ",".join(sorted(unk)) or "-")
+    t = max(ts(g.get(k)) for k in ("created", "started", "ended", "updated"))
+    if t < lim: continue
+    gd = g.get("data") if isinstance(g.get("data"), dict) else {}
+    nm = str(gd.get("name") or g.get("description") or "job").replace("|", "/")
+    st = str(g.get("status")); cls = "O"
+    for k, s in sets:
+        if st in s: cls = k; break
+    e = ts(g.get("ended")); last = max(last, e)
+    if nm not in latest or t >= latest[nm][0]:
+        latest[nm] = (t, cls, st, g.get("items_completed", 0), g.get("items", 0), int(e), str(g.get("log_file", "")).replace("|", "/"))
+cnt = {"C": 0, "P": 0, "R": 0, "F": 0, "O": 0}
+for nm, v in latest.items():
+    cnt[v[1]] += 1
+    if v[1] == "O": unk.add(v[2])
+print("S|%d|%d|%d|%d|%d|%d|%d|%s" % (len(latest), cnt["C"], cnt["P"], cnt["R"], cnt["F"], cnt["O"], int(last), ",".join(sorted(unk)) or "-"))
+for nm, v in sorted(latest.items(), key=lambda x: x[1][0]):
+    print("G|%s|%s|%s|%s|%s|%d|%s" % (v[1], nm, v[2], v[3], v[4], v[5], v[6]))
 ' "$@"
 }
 
 check_jetbackup() {
   [[ "$JB_ENABLED" == "yes" ]] || return 0
-  local api raw out st total completed partial running failed other lastend unk lvl=0 sec="" now age_h
+  local api raw out first lvl=0 sec="" now age_h label when logs
+  local total completed partial running failed other lastend unk
+  local cls name st dn items endts lf
   api="$(command -v jetbackup5api || true)"
   if [[ -z "$api" ]]; then
     add "$(icon 1) JetBackup : WARN"; add "Warning   : jetbackup5api not found"; add ""; raise 1; return
@@ -201,26 +235,34 @@ check_jetbackup() {
     add "$(icon 1) JetBackup : WARN"; add "Warning   : python3 not found (needed to read the API output)"; add ""; raise 1; return
   fi
 
-  raw="$("$api" -F listQueueGroups -O json 2>&1)"
-  out="$(printf '%s' "$raw" | jb_parse "$JB_WINDOW_H" "$JB_TYPE_FILTER" "$JB_ST_COMPLETED" "$JB_ST_PARTIAL" "$JB_ST_RUNNING" "$JB_ST_FAILED" 2>&1)"
-  read -r st total completed partial running failed other lastend unk <<< "$out"
-
-  if [[ "$st" != "OK" ]]; then
+  raw="$("$api" -F listQueueGroups -O json -D "type=${JB_QUEUE_TYPE}" 2>&1)"
+  out="$(printf '%s' "$raw" | jb_parse "$JB_WINDOW_H" "$JB_ST_COMPLETED" "$JB_ST_PARTIAL" "$JB_ST_RUNNING" "$JB_ST_FAILED" 2>&1)"
+  first="$(printf '%s\n' "$out" | head -1)"
+  if [[ "$first" != S\|* ]]; then
     add "$(icon 1) JetBackup : WARN"
-    add "Warning   : could not read JetBackup status (${out}) - run: $0 --debug-jb"
+    add "Warning   : could not read JetBackup status (${first}) - run: $0 --debug-jb"
     add ""; raise 1; return
   fi
+  IFS='|' read -r _ total completed partial running failed other lastend unk <<< "$first"
 
   now=$(date +%s)
-  sec+="Backup runs : last ${JB_WINDOW_H}h -> ${total} total | ${completed} completed | ${partial} partial | ${running} running | ${failed} failed"$'\n'
+  sec+="Backup jobs : last ${JB_WINDOW_H}h -> ${total} job(s) | ${completed} completed | ${partial} partial | ${running} running | ${failed} failed"$'\n'
+  while IFS='|' read -r _ cls name st dn items endts lf; do
+    case "$cls" in C) label="completed";; P) label="partial";; R) label="running";; F) label="FAILED";; *) label="unknown status ${st}";; esac
+    if (( endts > 0 )); then when="finished $(( (now - endts) / 3600 ))h ago"; else when="not finished yet"; fi
+    sec+="  ${name} : ${label} (${dn}/${items} items) - ${when}"$'\n'
+    if [[ "$cls" == "P" || "$cls" == "F" || "$cls" == "O" ]] && [[ -r "$lf" ]]; then
+      logs="$(grep -iE 'warn|error|fail|partial' "$lf" 2>/dev/null | tail -3 | cut -c1-160)"
+      [[ -n "$logs" ]] && sec+="$(printf '%s\n' "$logs" | sed 's/^/      log: /')"$'\n'
+    fi
+  done < <(printf '%s\n' "$out" | grep '^G|')
   if (( lastend > 0 )); then age_h=$(( (now - lastend) / 3600 )); sec+="Last finish : ${age_h}h ago"$'\n'; fi
 
-  if   (( total == 0 ));     then lvl=1; sec+="Warning   : no JetBackup runs in the last ${JB_WINDOW_H}h"$'\n'
-  elif (( failed > 0 ));     then lvl=2; sec+="Problem   : ${failed} failed run(s)"$'\n'
+  if   (( total == 0 )); then lvl=1; sec+="Warning   : no JetBackup runs in the last ${JB_WINDOW_H}h"$'\n'
+  elif (( failed > 0 )); then lvl=2; sec+="Problem   : ${failed} failed job(s)"$'\n'
   fi
-  if (( partial > 0 )); then (( lvl < 1 )) && lvl=1; sec+="Warning   : ${partial} partially completed run(s)"$'\n'; fi
-  if (( other > 0 ));   then (( lvl < 1 )) && lvl=1; sec+="Warning   : ${other} run(s) with unknown status code(s): ${unk} (adjust JB_ST_* in the config)"$'\n'; fi
-  if (( total > 0 && completed == 0 && running == 0 && failed == 0 && partial == 0 )); then (( lvl < 1 )) && lvl=1; fi
+  if (( partial > 0 )); then (( lvl < 1 )) && lvl=1; sec+="Warning   : ${partial} partially completed job(s)"$'\n'; fi
+  if (( other > 0 ));   then (( lvl < 1 )) && lvl=1; sec+="Warning   : ${other} job(s) with unknown status code(s): ${unk} (adjust JB_ST_* in the config)"$'\n'; fi
 
   add "$(icon $lvl) JetBackup : $(lname $lvl)"
   add "${sec%$'\n'}"; add ""; raise $lvl
@@ -359,7 +401,7 @@ case "${1:-}" in
     exit 0 ;;
   --debug-jb)
     command -v jetbackup5api >/dev/null 2>&1 || { echo "jetbackup5api not found"; exit 1; }
-    jetbackup5api -F listQueueGroups -O json 2>&1 | head -c 6000; echo
+    jetbackup5api -F listQueueGroups -O json -D "type=${JB_QUEUE_TYPE}" 2>&1 | head -c 6000; echo
     exit 0 ;;
   ""|--dry-run) ;;
   *) echo "Unknown option: $1"; usage; exit 1 ;;
