@@ -22,13 +22,13 @@
 #  Exit code: 0 = OK, 1 = WARN, 2 = FAIL
 # ==============================================================================
 
-export PATH=/usr/local/cpanel/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/cpanel/bin:$PATH
 
 VERSION="1.1"
 AUTHOR="Eng. Samir Abou El Khair"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="${BM_CONF:-${SCRIPT_DIR}/backup-monitor.conf}"
-HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
+HOSTNAME_FQDN="$(/usr/bin/hostname -f 2>/dev/null || /usr/bin/hostname)"
 
 # ----------------------------- defaults ---------------------------------------
 LOG_FILE="/var/log/cpanel-backup-monitor.log"
